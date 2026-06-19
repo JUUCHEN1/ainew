@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<title>漫创AI · 创作画布</title>
+<meta name="viewport" content="width=1600, initial-scale=1" />
+<link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+<template id="__bundler_thumbnail">
+  <svg viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">
+    <rect width="120" height="120" fill="#EAF6FF"/>
+    <g stroke="#55B6F2" stroke-width="1.5" fill="none">
+      <rect x="22" y="30" width="26" height="20" rx="3"/>
+      <rect x="72" y="30" width="26" height="20" rx="3"/>
+      <rect x="47" y="70" width="26" height="20" rx="3"/>
+      <path d="M48 40 L72 40 M35 50 L55 70 M85 50 L73 70"/>
+    </g>
+    <text x="60" y="108" text-anchor="middle" fill="#F76D9E" font-family="sans-serif" font-size="9" font-weight="700" letter-spacing="1">漫创AI</text>
+  </svg>
+</template>
+
+<style>
+  html, body { margin:0; padding:0; height:100%; overflow:hidden; }
+  body { font-family: "Noto Sans SC", "IBM Plex Sans", system-ui, sans-serif; color:#16233A; background:#EAF6FF; }
+  #root { height:100vh; width:100vw; }
+  button { font-family:inherit; color:inherit; }
+  * { box-sizing:border-box; }
+
+  /* ===== Theme A · Aerial Blue Rose Light ===== */
+  .theme-a {
+    color-scheme: light;
+    --bg: #EAF6FF;
+    --bg-deep: #D7ECFF;
+    --paper: #F8FCFF;
+    --paper-2: #EAF4FF;
+    --paper-3: #DCEBFA;
+    --ink: #16233A;
+    --ink-soft: #3D5774;
+    --ink-mute: #6E87A3;
+    --line: #BFD8EE;
+    --line-soft: #D7E8F7;
+    --accent: #55B6F2;
+    --accent-soft: #BFE7FF;
+    --accent-2: #F76D9E;
+    --accent-3: #FFB86C;
+    --warn: #F59E0B;
+    --radius-lg: 14px;
+    --radius-md: 10px;
+    --radius-sm: 6px;
+    --font-display: "Noto Sans SC", "IBM Plex Sans", sans-serif;
+    --font-body: "Noto Sans SC", "IBM Plex Sans", sans-serif;
+    --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+    --shadow-card: 0 1px 0 rgba(255,255,255,0.78) inset, 0 16px 42px -28px rgba(63,118,166,0.24);
+    --shadow-float: 0 26px 72px -36px rgba(67,110,158,0.34), 0 1px 0 rgba(255,255,255,0.88) inset;
+    --shadow-glow: 0 0 0 1px color-mix(in oklab, var(--accent) 20%, transparent), 0 20px 56px -34px color-mix(in oklab, var(--accent-2) 28%, transparent);
+  }
+  /* ===== Theme B · Atelier Noir Dark ===== */
+  .theme-b {
+    color-scheme: dark;
+    --bg: #0D0F0E;
+    --bg-deep: #171817;
+    --paper: #1A1C1A;
+    --paper-2: #22251F;
+    --paper-3: #2D3028;
+    --ink: #F3EEE3;
+    --ink-soft: #C8C1B3;
+    --ink-mute: #878477;
+    --line: #35372F;
+    --line-soft: #292C26;
+    --accent: #C6A66A;
+    --accent-soft: #E4D4AD;
+    --accent-2: #6F8B6B;
+    --accent-3: #9F7565;
+    --warn: #C08A4A;
+    --radius-lg: 14px;
+    --radius-md: 10px;
+    --radius-sm: 6px;
+    --font-display: "Noto Sans SC", "IBM Plex Sans", sans-serif;
+    --font-body: "Noto Sans SC", "IBM Plex Sans", sans-serif;
+    --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+    --shadow-card: 0 1px 0 rgba(255,255,255,0.035) inset, 0 14px 38px -26px rgba(0,0,0,0.86);
+    --shadow-float: 0 24px 76px -34px rgba(0,0,0,0.92), 0 1px 0 rgba(255,255,255,0.06) inset;
+    --shadow-glow: 0 0 0 1px color-mix(in oklab, var(--accent) 15%, transparent), 0 18px 58px -36px color-mix(in oklab, var(--accent) 34%, transparent);
+  }
+
+  :focus-visible {
+    outline: 2px solid color-mix(in oklab, var(--accent, #55B6F2) 84%, white);
+    outline-offset: 2px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      scroll-behavior: auto !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+
+  /* paper texture */
+  .paper-noise::before{
+    content:""; position:absolute; inset:0; pointer-events:none;
+    background-image:
+      radial-gradient(rgba(43,38,32,0.05) 1px, transparent 1.2px);
+    background-size: 3px 3px;
+    mix-blend-mode: multiply;
+    opacity:.5;
+  }
+
+  /* scrollbar */
+  ::-webkit-scrollbar { width:8px; height:8px; }
+  ::-webkit-scrollbar-thumb { background: rgba(43,38,32,0.2); border-radius:4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+</style>
+
+  <!-- 运行时配置：指定后端地址。改这里即可，无需重新打包前端。 -->
+  <script src="./config.js"></script>
+  <script type="module" crossorigin src="./assets/index-BE7HyvyE.js"></script>
+</head>
+<body>
+<div id="root"></div>
+
+
+</body>
+</html>
