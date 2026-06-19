@@ -14,6 +14,10 @@
     LIBAI_APP_DATA_DIR        数据/数据库目录，默认 ./data
     LIBAI_FFMPEG_PATH         ffmpeg 可执行文件路径（视频相关功能需要）
     LIBAI_FFPROBE_PATH        ffprobe 可执行文件路径
+    LIBAI_PUBLIC_BASE_URL     VPS 对外访问根地址。设置后参考图(图生视频等)
+                              改为本机自托管：存到 data/reference-media/ 并通过
+                              <地址>/media/references/<文件名> 对外提供，完全不
+                              依赖第三方图床。例：https://your-domain.example.com
 """
 from __future__ import annotations
 

@@ -2035,7 +2035,15 @@ def _reference_image_upload_url(payload: Dict[str, Any]) -> str:
 
 
 def _has_explicit_reference_image_upload_url(payload: Dict[str, Any]) -> bool:
-    return bool(_as_text(payload.get("referenceImageUploadUrl") or payload.get("reference_image_upload_url")))
+    # 自定义图床地址既可来自请求体，也可来自环境变量 LIBAI_REFERENCE_IMAGE_UPLOAD_URL。
+    # 只要任一处显式给出，就视为已配置图床，无需再要求对象存储。
+    return bool(
+        _as_text(
+            payload.get("referenceImageUploadUrl")
+            or payload.get("reference_image_upload_url")
+            or os.environ.get("LIBAI_REFERENCE_IMAGE_UPLOAD_URL")
+        )
+    )
 
 
 def _reference_image_require_s3(payload: Dict[str, Any]) -> bool:
@@ -2048,8 +2056,10 @@ def _reference_image_require_s3(payload: Dict[str, Any]) -> bool:
         "reference_image_require_rainyun",
     ):
         if key in payload:
-            return _parse_bool_value(payload.get(key), True)
-    return _env_bool("LIBAI_REFERENCE_IMAGE_REQUIRE_S3", True)
+            return _parse_bool_value(payload.get(key), False)
+    # 默认不强制对象存储：未配置 S3/COS 时自动回退到图床
+    # (默认 imageproxy.zhongzhuan.chat，或 LIBAI_REFERENCE_IMAGE_UPLOAD_URL 自定义)。
+    return _env_bool("LIBAI_REFERENCE_IMAGE_REQUIRE_S3", False)
 
 
 def _reference_image_s3_config(payload: Dict[str, Any]) -> Optional[Dict[str, str]]:
@@ -2753,14 +2763,85 @@ async def _read_reference_image_bytes(
     raise ProviderAdapterError(f"无法读取第 {index + 1} 张参考图")
 
 
+def _reference_public_base_url(payload: Dict[str, Any]) -> str:
+    """本机自托管参考图的公网根地址（VPS 的对外访问地址）。
+    设置后参考图会存到本地磁盘并通过后端自己的 /media/references/ 路由对外提供，
+    完全不依赖任何第三方图床/对象存储。"""
+    return _as_text(
+        payload.get("referencePublicBaseUrl")
+        or payload.get("reference_public_base_url")
+        or os.environ.get("LIBAI_PUBLIC_BASE_URL")
+    ).rstrip("/")
+
+
+def _reference_media_local_dir() -> Path:
+    base = _as_text(os.environ.get("LIBAI_APP_DATA_DIR"))
+    if base:
+        root = Path(base)
+    else:
+        appdata = _as_text(os.environ.get("APPDATA"))
+        # 与 app.py 的 app_data_dir() 回退保持一致（APP_NAME=\"LibAI\"），
+        # 否则自托管参考图的存储目录与对外 /media/references 路由不一致。
+        root = (Path(appdata) / "LibAI") if appdata else (Path.home() / ".libai")
+    target = root / "reference-media"
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _sync_store_reference_image_locally(
+    raw: bytes, mime: str, filename: str, digest: str, public_base_url: str
+) -> str:
+    extension = Path(filename or "").suffix or _image_extension_from_mime(mime)
+    if not extension.startswith("."):
+        extension = "." + extension
+    name = f"{digest}{extension}"
+    directory = _reference_media_local_dir()
+    target = directory / name
+    if not target.exists():
+        tmp = directory / f".{name}.{uuid.uuid4().hex}.tmp"
+        try:
+            tmp.write_bytes(raw)
+            tmp.replace(target)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+    return f"{public_base_url}/media/references/{name}"
+
+
+async def _store_reference_image_locally(
+    raw: bytes, mime: str, filename: str, digest: str, public_base_url: str
+) -> str:
+    try:
+        return await asyncio.to_thread(
+            _sync_store_reference_image_locally, raw, mime, filename, digest, public_base_url
+        )
+    except Exception as error:  # noqa: BLE001
+        message = str(error).strip() or type(error).__name__
+        raise ProviderAdapterError(f"参考图本地存储失败：{message}") from error
+
+
 async def _upload_reference_image_to_host(source: str, payload: Dict[str, Any], index: int) -> str:
     has_explicit_upload_url = _has_explicit_reference_image_upload_url(payload)
     s3_config = None if has_explicit_upload_url else _reference_image_s3_config(payload)
-    if s3_config is None and _reference_image_require_s3(payload) and not has_explicit_upload_url:
+    public_base_url = _reference_public_base_url(payload)
+    # 自托管本地存储：未配 S3、未显式指定图床，但设置了 VPS 公网地址时启用。
+    # 这样图生视频完全走本地，上游模型直接从本机后端拉取参考图。
+    use_local = s3_config is None and not has_explicit_upload_url and bool(public_base_url)
+    if (
+        s3_config is None
+        and not use_local
+        and _reference_image_require_s3(payload)
+        and not has_explicit_upload_url
+    ):
         raise ProviderAdapterError("参考图必须上传对象存储，但当前未配置对象存储")
-    upload_url = _reference_image_upload_url(payload) if s3_config is None else ""
-    if s3_config is None and not upload_url:
-        raise ProviderAdapterError("参考图图床上传地址未配置")
+    upload_url = ""
+    if s3_config is None and not use_local:
+        upload_url = _reference_image_upload_url(payload)
+        if not upload_url:
+            raise ProviderAdapterError("参考图图床上传地址未配置")
     raw, mime, filename = await _read_reference_image_bytes(source, payload, index)
     raw, mime, filename = await asyncio.to_thread(
         _compress_reference_image_for_hosting,
@@ -2793,7 +2874,11 @@ async def _upload_reference_image_to_host(source: str, payload: Dict[str, Any], 
             return hosted_url
         task = _REFERENCE_IMAGE_HOSTING_INFLIGHT.get(digest)
         if task is None:
-            if s3_config is not None:
+            if use_local:
+                task = asyncio.create_task(
+                    _store_reference_image_locally(raw, mime, filename, digest, public_base_url)
+                )
+            elif s3_config is not None:
                 task = asyncio.create_task(_put_reference_image_to_s3(s3_config, raw, mime, filename, digest))
             else:
                 task = asyncio.create_task(_post_reference_image_to_host(upload_url, raw, mime, filename))

@@ -149,6 +149,7 @@ SETTINGS_PATH = DATA_DIR / "settings.json"
 SEEDANCE_PORTRAIT_ASSETS_PATH = DATA_DIR / "seedance-portrait-assets.json"
 CHANNEL24_PORTRAIT_ASSETS_PATH = DATA_DIR / "channel24-portrait-assets.json"
 SEEDANCE_PORTRAIT_PREVIEWS_DIR = DATA_DIR / "seedance-portrait-previews"
+REFERENCE_MEDIA_DIR = DATA_DIR / "reference-media"
 SEEDANCE_PORTRAIT_ASSET_BRIDGE_PATH = "/v1/libai/seedance/assets"
 SEEDANCE_PORTRAIT_ASSET_LEGACY_PATH = "/v1/volc/assets"
 CHANNEL24_PORTRAIT_DEFAULT_BASE_URL = "https://manchuang.xyz/v1/libai/channel24"
@@ -11049,6 +11050,31 @@ def get_asset(asset_id: str):
     if not path.exists():
         raise HTTPException(status_code=404, detail="Asset file missing")
     return FileResponse(path, media_type=row["mime"])
+
+
+SAFE_REFERENCE_MEDIA_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+@app.head("/media/references/{name}")
+@app.get("/media/references/{name}")
+def get_reference_media(name: str):
+    """对外提供自托管的参考素材（图生视频等本地上传的参考图）。
+    上游模型/中转站会直接 GET 这个地址拉取参考图，因此必须是公开可访问的。
+    通过文件名白名单 + 目录约束防止路径穿越。"""
+    clean = str(name or "").strip()
+    if not clean or clean != os.path.basename(clean) or ".." in clean:
+        raise HTTPException(status_code=404, detail="Reference media not found")
+    if not SAFE_REFERENCE_MEDIA_NAME.match(clean):
+        raise HTTPException(status_code=404, detail="Reference media not found")
+    candidate = REFERENCE_MEDIA_DIR / clean
+    if not path_within(candidate, REFERENCE_MEDIA_DIR) or not candidate.is_file():
+        raise HTTPException(status_code=404, detail="Reference media not found")
+    media_type = mimetypes.guess_type(str(candidate))[0] or "application/octet-stream"
+    return FileResponse(
+        candidate,
+        media_type=media_type,
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 def asset_id_from_payload(payload: Dict[str, Any]) -> Optional[str]:
