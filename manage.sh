@@ -14,15 +14,35 @@
 # 用法：
 #   curl -fsSL https://raw.githubusercontent.com/JUUCHEN1/ainew/main/manage.sh | sudo bash
 #   或：sudo bash manage.sh
+#   安装后可直接输入：hb
 # ============================================================
-set -e
 
 # ---- 配置 ----
 INSTALL_DIR="/opt/libai-canvas-web"
 STATE_FILE="$INSTALL_DIR/.manage_state"
 REPO_URL="https://github.com/JUUCHEN1/ainew.git"
+SCRIPT_URL="https://raw.githubusercontent.com/JUUCHEN1/ainew/main/manage.sh"
 DEFAULT_PORT="8080"          # 本项目 Nginx 对外端口（可自定义）
 BACKEND_PORT="8765"          # 后端回环端口（内部）
+
+# ============================================================
+# 管道模式自举（curl | bash）
+# ------------------------------------------------------------
+# 通过管道运行时，stdin 是脚本内容本身，交互式 read 无法从终端读取，
+# 会出现“只显示标题就退出”的问题。这里把脚本下载成临时文件，再以
+# 终端（/dev/tty）作为 stdin 重新执行，保证菜单可正常交互。
+# ============================================================
+if [ -z "${LIBAI_BOOTSTRAPPED:-}" ] && [ ! -t 0 ] && [ -e /dev/tty ]; then
+    _self="$(mktemp /tmp/libai-manage.XXXXXX.sh 2>/dev/null || echo /tmp/libai-manage.sh)"
+    if curl -fsSL "$SCRIPT_URL" -o "$_self" 2>/dev/null && [ -s "$_self" ]; then
+        chmod +x "$_self" 2>/dev/null || true
+        LIBAI_BOOTSTRAPPED=1 exec bash "$_self" </dev/tty
+    fi
+fi
+
+# 注意：本脚本是交互式菜单，故意不使用 `set -e`。
+# 很多命令（[[ ]] 测试、grep、read）正常返回非零，set -e 会导致脚本
+# 莫名退出。关键步骤一律用显式的 `... || error "..."` 处理失败。
 
 # ---- 颜色 ----
 RED='\033[0;31m'
@@ -252,6 +272,7 @@ do_install() {
     INSTALLED="true"
     DOMAIN=""
     save_state
+    install_hb_shortcut
 
     get_server_ip
     echo ""
@@ -263,6 +284,7 @@ do_install() {
     echo ""
     info "后端绑在回环 127.0.0.1:$BACKEND_PORT，外网无法直连，安全。"
     info "准备好域名后，选菜单【2】加 HTTPS（config.js 无需改动）。"
+    info "以后管理本服务，终端直接输入：${GREEN}hb${NC}"
     echo ""
     read -p "按回车返回主菜单..." </dev/tty
     show_menu
@@ -552,6 +574,9 @@ do_uninstall() {
         rm -f /etc/nginx/snippets/_libai_proxy.inc
         systemctl reload nginx 2>/dev/null || true
     fi
+
+    # 清理 hb 快捷命令
+    rm -f /usr/local/bin/hb 2>/dev/null || true
 
     rm -rf "$INSTALL_DIR"
     ok "卸载完成"
@@ -913,6 +938,22 @@ restart_backend() {
     else
         systemctl restart libai-backend
     fi
+}
+
+# ---- 安装 hb 快捷命令 ----
+install_hb_shortcut() {
+    local target="/usr/local/bin/hb"
+    cat > "$target" <<EOF
+#!/usr/bin/env bash
+# 漫创AI Web 管理脚本快捷入口（由 manage.sh 自动生成）
+# 自动提权：非 root 时用 sudo 重新执行
+if [ "\$(id -u)" -ne 0 ]; then
+    exec sudo bash "$INSTALL_DIR/manage.sh" "\$@"
+fi
+exec bash "$INSTALL_DIR/manage.sh" "\$@"
+EOF
+    chmod +x "$target" 2>/dev/null || true
+    ok "已创建快捷命令：终端输入 hb 即可打开本管理脚本"
 }
 
 # ========== 入口 ==========
