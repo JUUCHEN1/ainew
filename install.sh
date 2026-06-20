@@ -113,7 +113,13 @@ confirm() {
     echo "  - 启动服务"
     echo ""
     read -p "确认开始？(y/N): " CONFIRM </dev/tty
-    [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]] && { info "已取消"; exit 0; }
+    # 去除前后空格
+    CONFIRM=$(echo "$CONFIRM" | tr -d '[:space:]')
+    if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
+        info "已取消"
+        exit 0
+    fi
+    ok "开始安装..."
 }
 
 # ---- 安装 Docker ----
@@ -149,12 +155,12 @@ clone_repo() {
     info "拉取代码到 /opt/libai-canvas-web..."
     if [[ -d /opt/libai-canvas-web/.git ]]; then
         warn "目录已存在，拉取最新代码..."
-        cd /opt/libai-canvas-web && git pull
+        cd /opt/libai-canvas-web && git pull || error "git pull 失败"
     else
         rm -rf /opt/libai-canvas-web
-        git clone https://github.com/JUUCHEN1/ainew.git /opt/libai-canvas-web
+        git clone https://github.com/JUUCHEN1/ainew.git /opt/libai-canvas-web || error "git clone 失败，请检查网络连接"
     fi
-    cd /opt/libai-canvas-web
+    cd /opt/libai-canvas-web || error "无法进入 /opt/libai-canvas-web 目录"
     ok "代码准备完成"
 }
 
