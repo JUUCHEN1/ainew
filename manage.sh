@@ -52,6 +52,104 @@ check_system() {
     fi
 }
 
+# ---- 智能检测 Nginx ----
+detect_nginx() {
+    NGINX_TYPE="none"
+    NGINX_DOCKER=""
+
+    # 检测 Docker 中的 Nginx
+    if command -v docker &>/dev/null; then
+        if docker ps --format '{{.Names}}' 2>/dev/null | grep -qi nginx; then
+            NGINX_TYPE="docker"
+            NGINX_DOCKER=$(docker ps --format '{{.Names}}' | grep -i nginx | head -1)
+            info "检测到 Docker Nginx 容器: $NGINX_DOCKER"
+            return 0
+        fi
+    fi
+
+    # 检测宿主机 Nginx
+    if command -v nginx &>/dev/null; then
+        NGINX_TYPE="host"
+        info "检测到宿主机 Nginx: $(nginx -v 2>&1)"
+        return 0
+    fi
+
+    info "未检测到 Nginx，将使用临时静态服务器（仅 IP 访问）"
+    return 1
+}
+
+# ---- 检测证书 ----
+detect_cert() {
+    [[ -z "$DOMAIN" ]] && return 1
+
+    # 检查常见证书路径
+    local cert_paths=(
+        "/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+        "/etc/nginx/ssl/$DOMAIN/fullchain.pem"
+        "$INSTALL_DIR/deploy/certs/fullchain.pem"
+    )
+
+    for path in "${cert_paths[@]}"; do
+        if [[ -f "$path" ]]; then
+            info "检测到已有证书: $path"
+            EXISTING_CERT_PATH="$path"
+            EXISTING_KEY_PATH="${path/fullchain.pem/privkey.pem}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# ---- 检测端口占用 ----
+check_port() {
+    local port=$1
+    # 优先用 lsof，没有则用 ss/netstat 兜底
+    if command -v lsof &>/dev/null; then
+        lsof -i :$port -sTCP:LISTEN >/dev/null 2>&1 && return 0 || return 1
+    elif command -v ss &>/dev/null; then
+        ss -ltn 2>/dev/null | grep -q ":$port " && return 0 || return 1
+    elif command -v netstat &>/dev/null; then
+        netstat -ltn 2>/dev/null | grep -q ":$port " && return 0 || return 1
+    fi
+    return 1
+}
+
+# ---- 清理端口占用 ----
+cleanup_port() {
+    local port=$1
+    info "检测到 $port 端口被占用，尝试自动清理..."
+
+    # 查找占用进程
+    local pids=$(lsof -ti :$port 2>/dev/null)
+    if [[ -z "$pids" ]]; then
+        return 0
+    fi
+
+    for pid in $pids; do
+        local process=$(ps -p $pid -o comm= 2>/dev/null)
+        warn "进程 $process (PID: $pid) 占用端口 $port"
+
+        # 如果是我们自己的服务，停止它
+        if [[ "$process" == "python"* ]] || [[ "$process" == "docker"* ]]; then
+            info "停止进程 $pid..."
+            kill $pid 2>/dev/null || true
+            sleep 1
+        fi
+    done
+
+    # 再次检查
+    if check_port $port; then
+        warn "端口 $port 仍被占用，可能需要手动处理"
+        read -p "是否继续？(y/N): " confirm </dev/tty
+        confirm=$(echo "$confirm" | tr -d '[:space:]')
+        [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return 1
+    fi
+
+    ok "端口 $port 已清理"
+    return 0
+}
+
 # ---- 加载状态 ----
 load_state() {
     if [[ -f "$STATE_FILE" ]]; then
@@ -210,31 +308,69 @@ do_configure_domain() {
 
     [[ "$INSTALLED" != "true" ]] && { error "请先安装服务（菜单选项 1）"; }
 
+    # 检测 Nginx
+    detect_nginx
+
     # 询问域名
     read -p "请输入你的域名（必须已解析到本机 IP）: " new_domain </dev/tty
     [[ -z "$new_domain" ]] && { warn "域名不能为空"; sleep 1; show_menu; return; }
     DOMAIN="$new_domain"
     ok "域名: $DOMAIN"
 
-    # 询问证书方式
-    echo ""
-    info "HTTPS 证书获取方式："
-    echo "  1) 自动申请 Let's Encrypt（推荐，域名必须已解析）"
-    echo "  2) 手动放置证书文件"
-    read -p "请输入 1 或 2: " cert_method </dev/tty
-    case "$cert_method" in
-        1) CERT_METHOD="auto" ;;
-        2) CERT_METHOD="manual" ;;
-        *) error "无效选择" ;;
-    esac
-    ok "证书方式: $CERT_METHOD"
+    # 检测已有证书
+    CERT_METHOD=""
+    if detect_cert; then
+        info "检测到已有证书: $EXISTING_CERT_PATH"
+        read -p "是否使用已有证书？(Y/n): " use_existing </dev/tty
+        use_existing=$(echo "$use_existing" | tr -d '[:space:]')
+        if [[ "$use_existing" != "n" && "$use_existing" != "N" ]]; then
+            CERT_METHOD="existing"
+            ok "将使用已有证书"
+        fi
+    fi
+
+    # 如果没有已有证书或用户选择不用，询问证书方式
+    if [[ -z "$CERT_METHOD" ]]; then
+        echo ""
+        info "HTTPS 证书获取方式："
+        echo "  1) 自动申请 Let's Encrypt（推荐，域名必须已解析）"
+        echo "  2) 手动放置证书文件"
+        read -p "请输入 1 或 2: " cert_method </dev/tty
+        case "$cert_method" in
+            1) CERT_METHOD="auto" ;;
+            2) CERT_METHOD="manual" ;;
+            *) error "无效选择" ;;
+        esac
+        ok "证书方式: $CERT_METHOD"
+    fi
+
+    # 根据 Nginx 类型决定配置方式
+    if [[ "$NGINX_TYPE" == "none" ]]; then
+        warn "未检测到 Nginx，需要安装 Nginx 才能配置 HTTPS"
+        read -p "是否安装 Nginx？(Y/n): " install_nginx </dev/tty
+        install_nginx=$(echo "$install_nginx" | tr -d '[:space:]')
+        if [[ "$install_nginx" == "n" || "$install_nginx" == "N" ]]; then
+            warn "跳过域名配置"
+            sleep 2
+            show_menu
+            return
+        fi
+        install_nginx_if_needed
+        NGINX_TYPE="host"
+    fi
 
     # 确认
     echo ""
     warn "即将执行："
     echo "  - 更新前端后端地址为 https://$DOMAIN"
-    echo "  - 生成 Nginx 配置"
-    if [[ "$CERT_METHOD" == "auto" ]]; then
+    if [[ "$NGINX_TYPE" == "docker" ]]; then
+        echo "  - 配置 Docker Nginx 容器"
+    else
+        echo "  - 配置宿主机 Nginx"
+    fi
+    if [[ "$CERT_METHOD" == "existing" ]]; then
+        echo "  - 使用已有证书: $EXISTING_CERT_PATH"
+    elif [[ "$CERT_METHOD" == "auto" ]]; then
         echo "  - 自动申请 Let's Encrypt 证书"
     fi
     echo "  - 重启服务"
@@ -250,26 +386,34 @@ do_configure_domain() {
     configure_env_domain
     configure_web_config_domain
 
-    # 配置 Nginx
-    if [[ "$DEPLOY_METHOD" == "docker" ]]; then
-        configure_nginx_docker
-        if [[ "$CERT_METHOD" == "auto" ]]; then
-            request_cert_docker
-        else
-            warn "请手动放置证书到 $INSTALL_DIR/deploy/certs/fullchain.pem 和 privkey.pem"
-            read -p "放置完成后按回车继续..." </dev/tty
-        fi
-        restart_docker_with_nginx
+    # 根据 Nginx 类型配置
+    if [[ "$NGINX_TYPE" == "docker" ]]; then
+        warn "检测到 Docker Nginx，请手动配置反向代理到 http://宿主机IP:8765"
+        warn "参考配置文件: $INSTALL_DIR/deploy/nginx/"
+        read -p "配置完成后按回车继续..." </dev/tty
     else
-        install_nginx_if_needed
+        # 宿主机 Nginx
         configure_nginx_systemd
-        if [[ "$CERT_METHOD" == "auto" ]]; then
+
+        if [[ "$CERT_METHOD" == "existing" ]]; then
+            # 使用已有证书，更新 Nginx 配置
+            sed -i "s|ssl_certificate .*|ssl_certificate $EXISTING_CERT_PATH;|" /etc/nginx/sites-available/libai.conf
+            sed -i "s|ssl_certificate_key .*|ssl_certificate_key $EXISTING_KEY_PATH;|" /etc/nginx/sites-available/libai.conf
+            ok "已配置使用现有证书"
+        elif [[ "$CERT_METHOD" == "auto" ]]; then
             request_cert_systemd
         else
             warn "请手动配置证书路径到 /etc/nginx/sites-available/libai.conf"
             read -p "配置完成后按回车继续..." </dev/tty
         fi
-        systemctl reload nginx
+
+        nginx -t && systemctl reload nginx || error "Nginx 配置错误"
+    fi
+
+    # 重启后端
+    if [[ "$DEPLOY_METHOD" == "docker" ]]; then
+        docker compose restart backend
+    else
         systemctl restart libai-backend
     fi
 
@@ -466,6 +610,13 @@ configure_env_basic() {
     cd "$INSTALL_DIR"
     cp -n .env.deploy.example .env.deploy || true
 
+    # 修复：systemd 模式下删除 Docker 专用的数据目录路径
+    # run.py 会自动使用默认值 ./data（相对于 WorkingDirectory）
+    if [[ "$DEPLOY_METHOD" == "systemd" ]]; then
+        sed -i '/^LIBAI_APP_DATA_DIR=/d' .env.deploy
+        sed -i '/^# LIBAI_APP_DATA_DIR=/d' .env.deploy
+    fi
+
     # 基础配置
     sed -i "s|^LIBAI_CORS_ORIGINS=.*|LIBAI_CORS_ORIGINS=|" .env.deploy
 
@@ -522,7 +673,7 @@ install_docker() {
 install_systemd_deps() {
     info "安装 Python / ffmpeg..."
     apt-get update -qq
-    apt-get install -y -qq python3 python3-venv python3-pip ffmpeg git curl
+    apt-get install -y -qq python3 python3-venv python3-pip ffmpeg git curl lsof
     ok "依赖安装完成"
 }
 
@@ -542,6 +693,16 @@ start_docker_no_nginx() {
     info "启动 Docker 服务（仅后端，暴露 8765）..."
     cd "$INSTALL_DIR"
 
+    # 检测端口冲突（修复 address already in use）
+    if check_port 8765; then
+        cleanup_port 8765 || warn "端口 8765 清理失败，启动可能失败"
+    fi
+
+    # 清理可能残留的旧容器和网络（修复 Docker 网络状态不一致）
+    docker compose down 2>/dev/null || true
+    docker ps -a --format '{{.Names}}' | grep -i libai | xargs -r docker rm -f 2>/dev/null || true
+    docker network prune -f 2>/dev/null || true
+
     # 生成临时 compose（不含 nginx）
     cat > docker-compose.override.yml <<'EOF'
 services:
@@ -555,6 +716,9 @@ EOF
 
     # 启动前端静态服务
     info "启动前端静态服务（5180）..."
+    if check_port 5180; then
+        cleanup_port 5180 || true
+    fi
     cd web
     nohup python3 -m http.server 5180 > /tmp/libai-frontend.log 2>&1 &
     echo $! > /tmp/libai-frontend.pid
@@ -586,6 +750,9 @@ start_systemd_backend_only() {
 
     info "创建 libai 用户..."
     useradd -r -s /usr/sbin/nologin libai 2>/dev/null || true
+
+    # 确保数据目录存在并赋权（修复 PermissionError）
+    mkdir -p "$INSTALL_DIR/data"
     chown -R libai:libai "$INSTALL_DIR/data"
 
     info "安装 systemd 服务..."
@@ -594,7 +761,15 @@ start_systemd_backend_only() {
     systemctl daemon-reload
     systemctl enable --now libai-backend
 
-    ok "后端服务已启动"
+    # 等待并验证后端启动
+    info "等待后端启动..."
+    sleep 3
+    if systemctl is-active --quiet libai-backend; then
+        ok "后端服务已启动"
+    else
+        warn "后端启动异常，查看日志：journalctl -u libai-backend -n 30"
+        journalctl -u libai-backend -n 15 --no-pager || true
+    fi
 
     # 启动前端
     info "启动前端静态服务（5180）..."
