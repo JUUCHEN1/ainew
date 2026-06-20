@@ -1,0 +1,53 @@
+# ============================================================
+# 漫创AI Web · 后端 systemd 服务单元
+# ------------------------------------------------------------
+# 安装：
+#   1. 把项目放到 /opt/libai-canvas-web（或改下面 WorkingDirectory）
+#   2. 建虚拟环境并装依赖：
+#        cd /opt/libai-canvas-web
+#        python3 -m venv .venv
+#        .venv/bin/pip install -r requirements.txt
+#   3. 复制本文件到 /etc/systemd/system/libai-backend.service
+#   4. 按需编辑下面的 User / 环境变量文件路径
+#   5. sudo systemctl daemon-reload
+#      sudo systemctl enable --now libai-backend
+#      sudo systemctl status libai-backend
+#   日志： journalctl -u libai-backend -f
+# ============================================================
+[Unit]
+Description=漫创AI Web Backend (FastAPI + uvicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 用非 root 普通用户运行更安全（先 useradd libai 或改成你的用户）
+User=libai
+Group=libai
+WorkingDirectory=/opt/libai-canvas-web
+
+# 环境变量（存储凭据/公网地址/CORS 等）。复制 .env.deploy.example 为
+# /opt/libai-canvas-web/.env.deploy 后填写。
+EnvironmentFile=/opt/libai-canvas-web/.env.deploy
+
+# ffmpeg 由系统包提供：apt install ffmpeg
+Environment=LIBAI_FFMPEG_PATH=/usr/bin/ffmpeg
+Environment=LIBAI_FFPROBE_PATH=/usr/bin/ffprobe
+
+ExecStart=/opt/libai-canvas-web/.venv/bin/python /opt/libai-canvas-web/server/run.py
+
+Restart=on-failure
+RestartSec=3
+# 优雅停机
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+# —— 基本加固 ——
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+# 数据目录需可写
+ReadWritePaths=/opt/libai-canvas-web/data
+
+[Install]
+WantedBy=multi-user.target
