@@ -2,7 +2,12 @@
 server/backend/reference-storage.env
 **/reference-storage.env
 *.env
+.env.deploy
 !*.env.example
+!.env.deploy.example
+
+# ===== 部署证书（私钥绝不入库）=====
+deploy/certs/
 
 # ===== 运行时数据 / 数据库 =====
 data/

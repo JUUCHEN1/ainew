@@ -2767,10 +2767,13 @@ def _reference_public_base_url(payload: Dict[str, Any]) -> str:
     """本机自托管参考图的公网根地址（VPS 的对外访问地址）。
     设置后参考图会存到本地磁盘并通过后端自己的 /media/references/ 路由对外提供，
     完全不依赖任何第三方图床/对象存储。"""
-    return _as_text(
-        payload.get("referencePublicBaseUrl")
-        or payload.get("reference_public_base_url")
-        or os.environ.get("LIBAI_PUBLIC_BASE_URL")
+    return (
+        _as_text(
+            payload.get("referencePublicBaseUrl")
+            or payload.get("reference_public_base_url")
+            or os.environ.get("LIBAI_PUBLIC_BASE_URL")
+        )
+        or ""
     ).rstrip("/")
 
 
@@ -4979,12 +4982,23 @@ def _is_veo_video_model(model: Dict[str, Any]) -> bool:
 
 def _is_seedance_video_model(model: Dict[str, Any]) -> bool:
     params = model.get("params") if isinstance(model.get("params"), dict) else {}
-    if str(params.get("videoProtocol") or "").strip().lower() == "public_video_api":
+    protocol = str(params.get("videoProtocol") or "").strip().lower()
+    if protocol == "public_video_api":
         return False
-    return (
+    if (
         _newapi_video_model_key(model) in SEEDANCE_VIDEO_MODEL_KEYS
         or str(params.get("upstreamModelName") or "").strip().lower() in SEEDANCE_VIDEO_MODEL_KEYS
-    )
+    ):
+        return True
+    # 兜底：中转站自动同步来的 seedance 视频模型（如 seedance-2.0-f720 /
+    # seedance-2.0-full / seedance-2.0-n / seedance-2.0-vip 等）params 为空、
+    # 不在写死白名单里，但它们确实是 seedance 视频模型，必须走
+    # /v1/video/generations 图生视频端点。按名称前缀识别，并排除已有专属
+    # 构建逻辑的 hermes（满血）与 public_video_api 协议，避免误伤。
+    if protocol == "hermes_video":
+        return False
+    key = _newapi_video_model_key(model)
+    return bool(re.match(r"^seedance[-_]?2", key))
 
 
 def _is_channel31_face_video_model(model: Dict[str, Any]) -> bool:
