@@ -2,7 +2,14 @@
 # ============================================================
 # 漫创AI Web · 管理脚本（Ubuntu/Debian）
 # ------------------------------------------------------------
-# 菜单式管理：安装、配置域名、修改存储、查看状态、重启、卸载
+# 统一 Nginx 入口架构：
+#   - 本项目自带一个 Nginx 入口，监听自定义端口（默认 8080），
+#     与你现有的其他 Nginx（如占用 80/443 的）互不干扰。
+#   - 后端 uvicorn 只绑回环 127.0.0.1:8765，外网碰不到，安全。
+#   - Nginx 同时托管前端静态 + 反代后端 API，前后端同源，
+#     所以 web/config.js 永远用 window.location.origin，
+#     IP 访问和以后加域名都自动正确，无需改配置。
+#   - 以后加域名 HTTPS：只在这个 Nginx 上加 443 块，config.js 不动。
 #
 # 用法：
 #   curl -fsSL https://raw.githubusercontent.com/JUUCHEN1/ainew/main/manage.sh | sudo bash
@@ -13,6 +20,9 @@ set -e
 # ---- 配置 ----
 INSTALL_DIR="/opt/libai-canvas-web"
 STATE_FILE="$INSTALL_DIR/.manage_state"
+REPO_URL="https://github.com/JUUCHEN1/ainew.git"
+DEFAULT_PORT="8080"          # 本项目 Nginx 对外端口（可自定义）
+BACKEND_PORT="8765"          # 后端回环端口（内部）
 
 # ---- 颜色 ----
 RED='\033[0;31m'
@@ -52,114 +62,52 @@ check_system() {
     fi
 }
 
-# ---- 智能检测 Nginx ----
-detect_nginx() {
-    NGINX_TYPE="none"
-    NGINX_DOCKER=""
-
-    # 检测 Docker 中的 Nginx
-    if command -v docker &>/dev/null; then
-        if docker ps --format '{{.Names}}' 2>/dev/null | grep -qi nginx; then
-            NGINX_TYPE="docker"
-            NGINX_DOCKER=$(docker ps --format '{{.Names}}' | grep -i nginx | head -1)
-            info "检测到 Docker Nginx 容器: $NGINX_DOCKER"
-            return 0
-        fi
-    fi
-
-    # 检测宿主机 Nginx
-    if command -v nginx &>/dev/null; then
-        NGINX_TYPE="host"
-        info "检测到宿主机 Nginx: $(nginx -v 2>&1)"
-        return 0
-    fi
-
-    info "未检测到 Nginx，将使用临时静态服务器（仅 IP 访问）"
-    return 1
-}
-
-# ---- 检测证书 ----
-detect_cert() {
-    [[ -z "$DOMAIN" ]] && return 1
-
-    # 检查常见证书路径
-    local cert_paths=(
-        "/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
-        "/etc/nginx/ssl/$DOMAIN/fullchain.pem"
-        "$INSTALL_DIR/deploy/certs/fullchain.pem"
-    )
-
-    for path in "${cert_paths[@]}"; do
-        if [[ -f "$path" ]]; then
-            info "检测到已有证书: $path"
-            EXISTING_CERT_PATH="$path"
-            EXISTING_KEY_PATH="${path/fullchain.pem/privkey.pem}"
-            return 0
-        fi
-    done
-
-    return 1
+# ---- 获取公网 IP ----
+get_server_ip() {
+    SERVER_IP=$(curl -s --max-time 5 ifconfig.me 2>/dev/null \
+        || curl -s --max-time 5 icanhazip.com 2>/dev/null \
+        || hostname -I 2>/dev/null | awk '{print $1}' \
+        || echo "YOUR_VPS_IP")
+    [[ -z "$SERVER_IP" ]] && SERVER_IP="YOUR_VPS_IP"
 }
 
 # ---- 检测端口占用 ----
-check_port() {
+port_in_use() {
     local port=$1
-    # 优先用 lsof，没有则用 ss/netstat 兜底
-    if command -v lsof &>/dev/null; then
-        lsof -i :$port -sTCP:LISTEN >/dev/null 2>&1 && return 0 || return 1
-    elif command -v ss &>/dev/null; then
+    if command -v ss &>/dev/null; then
         ss -ltn 2>/dev/null | grep -q ":$port " && return 0 || return 1
+    elif command -v lsof &>/dev/null; then
+        lsof -i :"$port" -sTCP:LISTEN >/dev/null 2>&1 && return 0 || return 1
     elif command -v netstat &>/dev/null; then
         netstat -ltn 2>/dev/null | grep -q ":$port " && return 0 || return 1
     fi
     return 1
 }
 
-# ---- 清理端口占用 ----
-cleanup_port() {
-    local port=$1
-    info "检测到 $port 端口被占用，尝试自动清理..."
-
-    # 查找占用进程
-    local pids=$(lsof -ti :$port 2>/dev/null)
-    if [[ -z "$pids" ]]; then
-        return 0
-    fi
-
-    for pid in $pids; do
-        local process=$(ps -p $pid -o comm= 2>/dev/null)
-        warn "进程 $process (PID: $pid) 占用端口 $port"
-
-        # 如果是我们自己的服务，停止它
-        if [[ "$process" == "python"* ]] || [[ "$process" == "docker"* ]]; then
-            info "停止进程 $pid..."
-            kill $pid 2>/dev/null || true
-            sleep 1
-        fi
+# ---- 选一个可用端口（从建议值开始递增）----
+pick_free_port() {
+    local start=$1
+    local p=$start
+    while port_in_use "$p"; do
+        p=$((p + 1))
+        [[ $p -gt $((start + 50)) ]] && { echo "$start"; return; }
     done
-
-    # 再次检查
-    if check_port $port; then
-        warn "端口 $port 仍被占用，可能需要手动处理"
-        read -p "是否继续？(y/N): " confirm </dev/tty
-        confirm=$(echo "$confirm" | tr -d '[:space:]')
-        [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return 1
-    fi
-
-    ok "端口 $port 已清理"
-    return 0
+    echo "$p"
 }
 
 # ---- 加载状态 ----
 load_state() {
     if [[ -f "$STATE_FILE" ]]; then
+        # shellcheck disable=SC1090
         source "$STATE_FILE"
     else
         INSTALLED="false"
         DEPLOY_METHOD=""
         DOMAIN=""
         STORAGE_METHOD=""
+        WEB_PORT="$DEFAULT_PORT"
     fi
+    [[ -z "$WEB_PORT" ]] && WEB_PORT="$DEFAULT_PORT"
 }
 
 # ---- 保存状态 ----
@@ -170,6 +118,7 @@ INSTALLED="true"
 DEPLOY_METHOD="$DEPLOY_METHOD"
 DOMAIN="$DOMAIN"
 STORAGE_METHOD="$STORAGE_METHOD"
+WEB_PORT="$WEB_PORT"
 EOF
 }
 
@@ -179,33 +128,38 @@ show_menu() {
     load_state
 
     if [[ "$INSTALLED" == "true" ]]; then
-        echo -e "${GREEN}✓ 已安装${NC} | 部署方式: ${CYAN}$DEPLOY_METHOD${NC} | 域名: ${CYAN}${DOMAIN:-未配置}${NC}"
+        get_server_ip
+        local access="http://$SERVER_IP:$WEB_PORT"
+        [[ -n "$DOMAIN" ]] && access="https://$DOMAIN"
+        echo -e "${GREEN}✓ 已安装${NC} | 方式: ${CYAN}$DEPLOY_METHOD${NC} | 端口: ${CYAN}$WEB_PORT${NC} | 访问: ${CYAN}$access${NC}"
     else
         echo -e "${YELLOW}未检测到安装${NC}"
     fi
 
     echo ""
     echo "═══════════════ 主菜单 ═══════════════"
-    echo "  1) 全新安装（仅后端+前端，跳过域名和 Nginx）"
-    echo "  2) 配置域名和 HTTPS（生成 Nginx 配置 + 证书）"
-    echo "  3) 修改存储方式（本地自托管 / S3 / 图床）"
-    echo "  4) 查看服务状态"
-    echo "  5) 重启服务"
-    echo "  6) 查看日志"
-    echo "  7) 卸载"
+    echo "  1) 全新安装（统一入口，IP 即可访问）"
+    echo "  2) 配置域名 + HTTPS（在已有入口上加证书）"
+    echo "  3) 修改对外端口"
+    echo "  4) 修改存储方式（本机自托管 / S3 / 图床）"
+    echo "  5) 查看服务状态"
+    echo "  6) 重启服务"
+    echo "  7) 查看日志"
+    echo "  8) 卸载"
     echo "  0) 退出"
     echo "══════════════════════════════════════"
     echo ""
-    read -p "请选择 [0-7]: " choice </dev/tty
+    read -p "请选择 [0-8]: " choice </dev/tty
 
     case "$choice" in
         1) do_install ;;
         2) do_configure_domain ;;
-        3) do_configure_storage ;;
-        4) do_status ;;
-        5) do_restart ;;
-        6) do_logs ;;
-        7) do_uninstall ;;
+        3) do_change_port ;;
+        4) do_configure_storage ;;
+        5) do_status ;;
+        6) do_restart ;;
+        7) do_logs ;;
+        8) do_uninstall ;;
         0) info "退出"; exit 0 ;;
         *) warn "无效选择"; sleep 1; show_menu ;;
     esac
@@ -214,22 +168,23 @@ show_menu() {
 # ================ 1. 全新安装 ================
 do_install() {
     banner
-    info "全新安装 - 仅部署后端 + 前端，暴露端口，跳过域名配置"
+    info "全新安装 - 统一 Nginx 入口，后端绑回环，IP 直接访问"
     echo ""
 
     if [[ "$INSTALLED" == "true" ]]; then
-        warn "检测到已安装，是否重新安装？(y/N)"
-        read -p "> " confirm </dev/tty
+        warn "检测到已安装，重新安装会覆盖配置（data/ 数据保留）"
+        read -p "继续？(y/N): " confirm </dev/tty
         confirm=$(echo "$confirm" | tr -d '[:space:]')
         [[ "$confirm" != "y" && "$confirm" != "Y" ]] && { show_menu; return; }
     fi
 
-    # 选择部署方式
+    # 部署方式
     echo ""
     info "请选择部署方式："
     echo "  1) Docker + Compose（推荐，环境隔离）"
     echo "  2) systemd（不装 Docker，资源最省）"
     read -p "请输入 1 或 2: " method </dev/tty
+    method=$(echo "$method" | tr -d '[:space:]')
     case "$method" in
         1) DEPLOY_METHOD="docker" ;;
         2) DEPLOY_METHOD="systemd" ;;
@@ -237,13 +192,28 @@ do_install() {
     esac
     ok "部署方式: $DEPLOY_METHOD"
 
-    # 选择存储
+    # 对外端口
+    echo ""
+    local suggest
+    suggest=$(pick_free_port "$DEFAULT_PORT")
+    info "本项目 Nginx 对外端口（与你现有的 80/443 服务互不干扰）"
+    read -p "请输入对外端口 [默认 $suggest]: " input_port </dev/tty
+    input_port=$(echo "$input_port" | tr -d '[:space:]')
+    WEB_PORT="${input_port:-$suggest}"
+    if port_in_use "$WEB_PORT"; then
+        warn "端口 $WEB_PORT 已被占用，自动改用 $(pick_free_port "$WEB_PORT")"
+        WEB_PORT=$(pick_free_port "$WEB_PORT")
+    fi
+    ok "对外端口: $WEB_PORT"
+
+    # 存储
     echo ""
     info "参考图存储方式（图生视频需要公网可访问的图片 URL）："
-    echo "  1) VPS 本机自托管（推荐，后续配置域名后自动生效）"
+    echo "  1) VPS 本机自托管（推荐，经本项目 Nginx 对外）"
     echo "  2) S3 / 腾讯云 COS（需手动编辑配置文件）"
     echo "  3) 自定义图床（需手动编辑配置文件）"
     read -p "请输入 1/2/3: " storage </dev/tty
+    storage=$(echo "$storage" | tr -d '[:space:]')
     case "$storage" in
         1) STORAGE_METHOD="local" ;;
         2) STORAGE_METHOD="s3" ;;
@@ -254,11 +224,11 @@ do_install() {
 
     # 确认
     echo ""
-    warn "即将开始安装，将执行："
-    echo "  - 安装依赖（Docker 或 Python/ffmpeg）"
+    warn "即将执行："
+    echo "  - 安装依赖（${DEPLOY_METHOD} 所需）"
     echo "  - 拉取代码到 $INSTALL_DIR"
-    echo "  - 配置环境变量"
-    echo "  - 启动服务（后端 8765，前端 5180）"
+    echo "  - 后端绑回环 127.0.0.1:$BACKEND_PORT"
+    echo "  - 启动 Nginx 入口，监听 $WEB_PORT"
     echo ""
     read -p "确认开始？(y/N): " confirm </dev/tty
     confirm=$(echo "$confirm" | tr -d '[:space:]')
@@ -266,174 +236,181 @@ do_install() {
 
     ok "开始安装..."
 
-    # 执行安装
     clone_repo
     configure_env_basic
-    configure_web_config_ip
+    configure_web_config_origin
 
     if [[ "$DEPLOY_METHOD" == "docker" ]]; then
         install_docker
-        start_docker_no_nginx
+        start_docker
     else
         install_systemd_deps
-        start_systemd_backend_only
+        install_nginx_pkg
+        start_systemd
     fi
 
-    # 保存状态
     INSTALLED="true"
     DOMAIN=""
     save_state
 
+    get_server_ip
     echo ""
     ok "========================================="
     ok "安装完成！"
     ok "========================================="
     echo ""
-    get_server_ip
-    echo -e "  后端地址: ${GREEN}http://$SERVER_IP:8765/health${NC}"
-    echo -e "  前端地址: ${GREEN}http://$SERVER_IP:5180${NC}"
+    echo -e "  访问地址: ${GREEN}http://$SERVER_IP:$WEB_PORT${NC}"
     echo ""
-    warn "当前使用 IP + 端口访问，无 HTTPS。"
-    info "准备好域名后，选择菜单【2】配置域名和 HTTPS。"
+    info "后端绑在回环 127.0.0.1:$BACKEND_PORT，外网无法直连，安全。"
+    info "准备好域名后，选菜单【2】加 HTTPS（config.js 无需改动）。"
     echo ""
     read -p "按回车返回主菜单..." </dev/tty
     show_menu
 }
 
-# ================ 2. 配置域名和 HTTPS ================
+# ================ 2. 配置域名 + HTTPS ================
 do_configure_domain() {
     banner
-    info "配置域名和 HTTPS"
+    info "配置域名 + HTTPS（在本项目 Nginx 入口上加证书）"
     echo ""
 
     [[ "$INSTALLED" != "true" ]] && { error "请先安装服务（菜单选项 1）"; }
 
-    # 检测 Nginx
-    detect_nginx
-
-    # 询问域名
     read -p "请输入你的域名（必须已解析到本机 IP）: " new_domain </dev/tty
+    new_domain=$(echo "$new_domain" | tr -d '[:space:]')
     [[ -z "$new_domain" ]] && { warn "域名不能为空"; sleep 1; show_menu; return; }
     DOMAIN="$new_domain"
     ok "域名: $DOMAIN"
 
-    # 检测已有证书
-    CERT_METHOD=""
-    if detect_cert; then
-        info "检测到已有证书: $EXISTING_CERT_PATH"
-        read -p "是否使用已有证书？(Y/n): " use_existing </dev/tty
+    # 证书：检测已有 / 申请 / 手动
+    echo ""
+    CERT_FULLCHAIN=""
+    CERT_KEY=""
+    if detect_existing_cert; then
+        info "检测到已有证书: $CERT_FULLCHAIN"
+        read -p "使用已有证书？(Y/n): " use_existing </dev/tty
         use_existing=$(echo "$use_existing" | tr -d '[:space:]')
-        if [[ "$use_existing" != "n" && "$use_existing" != "N" ]]; then
-            CERT_METHOD="existing"
-            ok "将使用已有证书"
-        fi
+        [[ "$use_existing" == "n" || "$use_existing" == "N" ]] && { CERT_FULLCHAIN=""; CERT_KEY=""; }
     fi
 
-    # 如果没有已有证书或用户选择不用，询问证书方式
-    if [[ -z "$CERT_METHOD" ]]; then
+    local cert_mode="existing"
+    if [[ -z "$CERT_FULLCHAIN" ]]; then
         echo ""
         info "HTTPS 证书获取方式："
-        echo "  1) 自动申请 Let's Encrypt（推荐，域名必须已解析）"
+        echo "  1) 自动申请 Let's Encrypt（域名必须已解析到本机）"
         echo "  2) 手动放置证书文件"
-        read -p "请输入 1 或 2: " cert_method </dev/tty
-        case "$cert_method" in
-            1) CERT_METHOD="auto" ;;
-            2) CERT_METHOD="manual" ;;
+        read -p "请输入 1 或 2: " cm </dev/tty
+        cm=$(echo "$cm" | tr -d '[:space:]')
+        case "$cm" in
+            1) cert_mode="auto" ;;
+            2) cert_mode="manual" ;;
             *) error "无效选择" ;;
         esac
-        ok "证书方式: $CERT_METHOD"
     fi
 
-    # 根据 Nginx 类型决定配置方式
-    if [[ "$NGINX_TYPE" == "none" ]]; then
-        warn "未检测到 Nginx，需要安装 Nginx 才能配置 HTTPS"
-        read -p "是否安装 Nginx？(Y/n): " install_nginx </dev/tty
-        install_nginx=$(echo "$install_nginx" | tr -d '[:space:]')
-        if [[ "$install_nginx" == "n" || "$install_nginx" == "N" ]]; then
-            warn "跳过域名配置"
-            sleep 2
-            show_menu
-            return
-        fi
-        install_nginx_if_needed
-        NGINX_TYPE="host"
-    fi
+    # HTTPS 监听端口
+    echo ""
+    local https_suggest=443
+    port_in_use 443 && https_suggest=8443
+    info "HTTPS 监听端口（443 被占用可换其他，如 8443）"
+    read -p "请输入 HTTPS 端口 [默认 $https_suggest]: " https_port </dev/tty
+    https_port=$(echo "$https_port" | tr -d '[:space:]')
+    HTTPS_PORT="${https_port:-$https_suggest}"
+    ok "HTTPS 端口: $HTTPS_PORT"
 
-    # 确认
     echo ""
     warn "即将执行："
-    echo "  - 更新前端后端地址为 https://$DOMAIN"
-    if [[ "$NGINX_TYPE" == "docker" ]]; then
-        echo "  - 配置 Docker Nginx 容器"
-    else
-        echo "  - 配置宿主机 Nginx"
-    fi
-    if [[ "$CERT_METHOD" == "existing" ]]; then
-        echo "  - 使用已有证书: $EXISTING_CERT_PATH"
-    elif [[ "$CERT_METHOD" == "auto" ]]; then
-        echo "  - 自动申请 Let's Encrypt 证书"
-    fi
-    echo "  - 重启服务"
+    echo "  - 在 $DOMAIN 上启用 HTTPS（端口 $HTTPS_PORT）"
+    [[ "$cert_mode" == "auto" ]] && echo "  - 自动申请 Let's Encrypt 证书（临时占用 80 端口验证）"
+    [[ "$cert_mode" == "existing" ]] && echo "  - 使用已有证书 $CERT_FULLCHAIN"
+    echo "  - 前端 config.js 无需改动（同源）"
     echo ""
     read -p "确认继续？(y/N): " confirm </dev/tty
     confirm=$(echo "$confirm" | tr -d '[:space:]')
     [[ "$confirm" != "y" && "$confirm" != "Y" ]] && { info "已取消"; show_menu; return; }
 
-    ok "开始配置..."
-
-    # 更新配置
     cd "$INSTALL_DIR"
+
+    # 申请证书
+    if [[ "$cert_mode" == "auto" ]]; then
+        request_cert_letsencrypt || { warn "证书申请失败，返回菜单"; sleep 2; show_menu; return; }
+        CERT_FULLCHAIN="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+        CERT_KEY="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+    elif [[ "$cert_mode" == "manual" ]]; then
+        mkdir -p "$INSTALL_DIR/deploy/certs"
+        warn "请把证书放到："
+        echo "    $INSTALL_DIR/deploy/certs/fullchain.pem"
+        echo "    $INSTALL_DIR/deploy/certs/privkey.pem"
+        read -p "放置完成后按回车继续..." </dev/tty
+        CERT_FULLCHAIN="$INSTALL_DIR/deploy/certs/fullchain.pem"
+        CERT_KEY="$INSTALL_DIR/deploy/certs/privkey.pem"
+        [[ -f "$CERT_FULLCHAIN" && -f "$CERT_KEY" ]] || { warn "未找到证书文件"; sleep 2; show_menu; return; }
+    fi
+
+    # 更新存储公网地址为 https 域名
     configure_env_domain
-    configure_web_config_domain
 
-    # 根据 Nginx 类型配置
-    if [[ "$NGINX_TYPE" == "docker" ]]; then
-        warn "检测到 Docker Nginx，请手动配置反向代理到 http://宿主机IP:8765"
-        warn "参考配置文件: $INSTALL_DIR/deploy/nginx/"
-        read -p "配置完成后按回车继续..." </dev/tty
-    else
-        # 宿主机 Nginx
-        configure_nginx_systemd
-
-        if [[ "$CERT_METHOD" == "existing" ]]; then
-            # 使用已有证书，更新 Nginx 配置
-            sed -i "s|ssl_certificate .*|ssl_certificate $EXISTING_CERT_PATH;|" /etc/nginx/sites-available/libai.conf
-            sed -i "s|ssl_certificate_key .*|ssl_certificate_key $EXISTING_KEY_PATH;|" /etc/nginx/sites-available/libai.conf
-            ok "已配置使用现有证书"
-        elif [[ "$CERT_METHOD" == "auto" ]]; then
-            request_cert_systemd
-        else
-            warn "请手动配置证书路径到 /etc/nginx/sites-available/libai.conf"
-            read -p "配置完成后按回车继续..." </dev/tty
-        fi
-
-        nginx -t && systemctl reload nginx || error "Nginx 配置错误"
-    fi
-
-    # 重启后端
+    # 应用 HTTPS 配置
     if [[ "$DEPLOY_METHOD" == "docker" ]]; then
-        docker compose restart backend
+        apply_https_docker
     else
-        systemctl restart libai-backend
+        apply_https_systemd
     fi
 
-    # 保存状态
     save_state
 
     echo ""
     ok "========================================="
-    ok "域名配置完成！"
+    ok "HTTPS 配置完成！"
     ok "========================================="
     echo ""
-    echo -e "  访问地址: ${GREEN}https://$DOMAIN${NC}"
+    local url="https://$DOMAIN"
+    [[ "$HTTPS_PORT" != "443" ]] && url="https://$DOMAIN:$HTTPS_PORT"
+    echo -e "  访问地址: ${GREEN}$url${NC}"
     echo ""
-    warn "安全提醒: 建议在 Nginx 层加访问控制（IP 白名单 / basic auth）"
+    warn "安全提醒：建议在 Nginx 层加访问控制（IP 白名单 / basic auth）"
     echo ""
     read -p "按回车返回主菜单..." </dev/tty
     show_menu
 }
 
-# ================ 3. 修改存储方式 ================
+# ================ 3. 修改对外端口 ================
+do_change_port() {
+    banner
+    info "修改对外端口"
+    echo ""
+
+    [[ "$INSTALLED" != "true" ]] && { error "请先安装服务（菜单选项 1）"; }
+
+    echo "当前端口: ${CYAN}$WEB_PORT${NC}"
+    read -p "请输入新端口: " new_port </dev/tty
+    new_port=$(echo "$new_port" | tr -d '[:space:]')
+    [[ -z "$new_port" ]] && { warn "端口不能为空"; sleep 1; show_menu; return; }
+    if port_in_use "$new_port"; then
+        warn "端口 $new_port 已被占用"
+        sleep 2; show_menu; return
+    fi
+
+    WEB_PORT="$new_port"
+    cd "$INSTALL_DIR"
+
+    if [[ "$DEPLOY_METHOD" == "docker" ]]; then
+        regen_compose
+        docker compose -f deploy/docker-compose.libai.yml up -d
+    else
+        regen_nginx_http_systemd
+        nginx -t && systemctl reload nginx
+    fi
+
+    save_state
+    get_server_ip
+    ok "端口已改为 $WEB_PORT"
+    echo -e "  访问地址: ${GREEN}http://$SERVER_IP:$WEB_PORT${NC}"
+    read -p "按回车返回主菜单..." </dev/tty
+    show_menu
+}
+
+# ================ 4. 修改存储方式 ================
 do_configure_storage() {
     banner
     info "修改存储方式"
@@ -441,12 +418,13 @@ do_configure_storage() {
 
     [[ "$INSTALLED" != "true" ]] && { error "请先安装服务（菜单选项 1）"; }
 
-    echo "当前存储方式: ${CYAN}${STORAGE_METHOD:-未设置}${NC}"
+    echo -e "当前存储方式: ${CYAN}${STORAGE_METHOD:-未设置}${NC}"
     echo ""
     echo "  1) VPS 本机自托管"
     echo "  2) S3 / 腾讯云 COS"
     echo "  3) 自定义图床"
-    read -p "请选择新的存储方式 [1-3]: " storage </dev/tty
+    read -p "请选择 [1-3]: " storage </dev/tty
+    storage=$(echo "$storage" | tr -d '[:space:]')
     case "$storage" in
         1) STORAGE_METHOD="local" ;;
         2) STORAGE_METHOD="s3" ;;
@@ -457,35 +435,21 @@ do_configure_storage() {
     cd "$INSTALL_DIR"
 
     if [[ "$STORAGE_METHOD" == "local" ]]; then
-        if [[ -n "$DOMAIN" ]]; then
-            sed -i "s|^LIBAI_PUBLIC_BASE_URL=.*|LIBAI_PUBLIC_BASE_URL=https://$DOMAIN|" .env.deploy
-            ok "本机自托管已配置，公网地址: https://$DOMAIN"
-        else
-            get_server_ip
-            sed -i "s|^LIBAI_PUBLIC_BASE_URL=.*|LIBAI_PUBLIC_BASE_URL=http://$SERVER_IP:8765|" .env.deploy
-            warn "当前未配置域名，使用 http://$SERVER_IP:8765（上游可能无法访问）"
-            info "建议先配置域名（菜单选项 2）"
-        fi
+        set_public_base_url
+        ok "本机自托管已配置，公网地址: $PUBLIC_BASE_URL"
     else
         warn "请手动编辑 $INSTALL_DIR/.env.deploy 填写 S3/图床凭据"
         read -p "编辑完成后按回车继续..." </dev/tty
     fi
 
-    # 重启服务
-    info "重启服务以应用新配置..."
-    if [[ "$DEPLOY_METHOD" == "docker" ]]; then
-        docker compose restart backend
-    else
-        systemctl restart libai-backend
-    fi
-
+    restart_backend
     save_state
-    ok "存储方式已更新并重启服务"
+    ok "存储方式已更新并重启后端"
     read -p "按回车返回主菜单..." </dev/tty
     show_menu
 }
 
-# ================ 4. 查看服务状态 ================
+# ================ 5. 查看状态 ================
 do_status() {
     banner
     info "服务状态"
@@ -494,21 +458,31 @@ do_status() {
     [[ "$INSTALLED" != "true" ]] && { warn "未检测到安装"; read -p "按回车返回..." </dev/tty; show_menu; return; }
 
     cd "$INSTALL_DIR"
+    get_server_ip
 
     if [[ "$DEPLOY_METHOD" == "docker" ]]; then
-        docker compose ps
+        docker compose -f deploy/docker-compose.libai.yml ps
     else
-        systemctl status libai-backend --no-pager -l
+        echo "— 后端 —"
+        systemctl status libai-backend --no-pager -l | head -8 || true
         echo ""
-        systemctl status nginx --no-pager -l
+        echo "— Nginx —"
+        systemctl status nginx --no-pager -l | head -6 || true
     fi
 
+    echo ""
+    echo -e "  对外端口: ${CYAN}$WEB_PORT${NC}"
+    echo -e "  访问地址: ${GREEN}http://$SERVER_IP:$WEB_PORT${NC}"
+    [[ -n "$DOMAIN" ]] && echo -e "  域名访问: ${GREEN}https://$DOMAIN${NC}"
+    echo ""
+    info "后端健康检查："
+    curl -s --max-time 5 "http://127.0.0.1:$BACKEND_PORT/health" && echo "" || warn "后端无响应"
     echo ""
     read -p "按回车返回主菜单..." </dev/tty
     show_menu
 }
 
-# ================ 5. 重启服务 ================
+# ================ 6. 重启 ================
 do_restart() {
     banner
     info "重启服务"
@@ -519,19 +493,19 @@ do_restart() {
     cd "$INSTALL_DIR"
 
     if [[ "$DEPLOY_METHOD" == "docker" ]]; then
-        docker compose restart
+        docker compose -f deploy/docker-compose.libai.yml restart
         ok "Docker 服务已重启"
     else
         systemctl restart libai-backend
         systemctl reload nginx 2>/dev/null || true
-        ok "systemd 服务已重启"
+        ok "服务已重启"
     fi
 
     read -p "按回车返回主菜单..." </dev/tty
     show_menu
 }
 
-# ================ 6. 查看日志 ================
+# ================ 7. 日志 ================
 do_logs() {
     banner
     info "查看日志（Ctrl+C 退出）"
@@ -542,7 +516,7 @@ do_logs() {
     cd "$INSTALL_DIR"
 
     if [[ "$DEPLOY_METHOD" == "docker" ]]; then
-        docker compose logs -f --tail=100
+        docker compose -f deploy/docker-compose.libai.yml logs -f --tail=100
     else
         journalctl -u libai-backend -f -n 100
     fi
@@ -550,7 +524,7 @@ do_logs() {
     show_menu
 }
 
-# ================ 7. 卸载 ================
+# ================ 8. 卸载 ================
 do_uninstall() {
     banner
     warn "卸载服务"
@@ -559,24 +533,22 @@ do_uninstall() {
     [[ "$INSTALLED" != "true" ]] && { warn "未检测到安装"; read -p "按回车返回..." </dev/tty; show_menu; return; }
 
     warn "将执行："
-    echo "  - 停止并删除服务"
-    echo "  - 删除 $INSTALL_DIR 目录（包括 data/，请提前备份）"
-    echo "  - 删除 Nginx 配置"
+    echo "  - 停止并删除本项目服务（不影响你其他的 Nginx/容器）"
+    echo "  - 删除 $INSTALL_DIR（含 data/，请提前备份）"
     echo ""
-    read -p "确认卸载？(yes/N): " confirm </dev/tty
-    [[ "$confirm" != "yes" ]] && { info "已取消"; show_menu; return; }
+    read -p "确认卸载？(输入 yes): " confirm </dev/tty
+    [[ "$confirm" != "yes" ]] && { info "已取消"; sleep 1; show_menu; return; }
 
-    cd "$INSTALL_DIR"
+    cd "$INSTALL_DIR" 2>/dev/null || true
 
     if [[ "$DEPLOY_METHOD" == "docker" ]]; then
-        docker compose down -v
+        docker compose -f deploy/docker-compose.libai.yml down -v 2>/dev/null || true
     else
-        systemctl stop libai-backend
-        systemctl disable libai-backend
+        systemctl stop libai-backend 2>/dev/null || true
+        systemctl disable libai-backend 2>/dev/null || true
         rm -f /etc/systemd/system/libai-backend.service
         systemctl daemon-reload
-        rm -f /etc/nginx/sites-enabled/libai.conf
-        rm -f /etc/nginx/sites-available/libai.conf
+        rm -f /etc/nginx/sites-enabled/libai.conf /etc/nginx/sites-available/libai.conf
         rm -f /etc/nginx/snippets/_libai_proxy.inc
         systemctl reload nginx 2>/dev/null || true
     fi
@@ -586,84 +558,118 @@ do_uninstall() {
     exit 0
 }
 
-# ========== 工具函数 ==========
-
-get_server_ip() {
-    SERVER_IP=$(curl -s ifconfig.me 2>/dev/null || curl -s icanhazip.com 2>/dev/null || echo "YOUR_VPS_IP")
-}
+# ============================================================
+#                       工具函数
+# ============================================================
 
 clone_repo() {
     info "拉取代码到 $INSTALL_DIR..."
     if [[ -d "$INSTALL_DIR/.git" ]]; then
-        warn "目录已存在，拉取最新代码..."
-        cd "$INSTALL_DIR" && git pull || error "git pull 失败"
+        cd "$INSTALL_DIR" && git pull --rebase 2>/dev/null || warn "git pull 失败，使用现有代码"
     else
         rm -rf "$INSTALL_DIR"
-        git clone https://github.com/JUUCHEN1/ainew.git "$INSTALL_DIR" || error "git clone 失败，请检查网络"
+        git clone "$REPO_URL" "$INSTALL_DIR" || error "git clone 失败，请检查网络"
     fi
     cd "$INSTALL_DIR" || error "无法进入 $INSTALL_DIR"
     ok "代码准备完成"
 }
 
-configure_env_basic() {
-    info "配置基础环境变量..."
+# 计算自托管公网 URL（供上游拉参考图）
+set_public_base_url() {
     cd "$INSTALL_DIR"
-    cp -n .env.deploy.example .env.deploy || true
+    if [[ -n "$DOMAIN" ]]; then
+        if [[ -n "$HTTPS_PORT" && "$HTTPS_PORT" != "443" ]]; then
+            PUBLIC_BASE_URL="https://$DOMAIN:$HTTPS_PORT"
+        else
+            PUBLIC_BASE_URL="https://$DOMAIN"
+        fi
+    else
+        get_server_ip
+        PUBLIC_BASE_URL="http://$SERVER_IP:$WEB_PORT"
+    fi
+    if grep -q '^LIBAI_PUBLIC_BASE_URL=' .env.deploy; then
+        sed -i "s|^LIBAI_PUBLIC_BASE_URL=.*|LIBAI_PUBLIC_BASE_URL=$PUBLIC_BASE_URL|" .env.deploy
+    else
+        echo "LIBAI_PUBLIC_BASE_URL=$PUBLIC_BASE_URL" >> .env.deploy
+    fi
+}
 
-    # 修复：systemd 模式下删除 Docker 专用的数据目录路径
-    # run.py 会自动使用默认值 ./data（相对于 WorkingDirectory）
+configure_env_basic() {
+    info "配置环境变量..."
+    cd "$INSTALL_DIR"
+    [[ -f .env.deploy ]] || cp .env.deploy.example .env.deploy
+
+    # 后端监听地址：
+    #   - Docker：绑 0.0.0.0（容器网络隔离已保证外网碰不到，nginx 容器需经 backend:端口 访问）
+    #   - systemd：绑 127.0.0.1（回环，外网无法直连，只能经 Nginx）
+    if [[ "$DEPLOY_METHOD" == "docker" ]]; then
+        set_env_var LIBAI_BACKEND_HOST 0.0.0.0
+    else
+        set_env_var LIBAI_BACKEND_HOST 127.0.0.1
+    fi
+    set_env_var LIBAI_BACKEND_PORT "$BACKEND_PORT"
+
+    # 同源反代，CORS 不需要
+    set_env_var LIBAI_CORS_ORIGINS ""
+
+    # systemd 模式：删除 Docker 容器内路径，用默认 ./data
     if [[ "$DEPLOY_METHOD" == "systemd" ]]; then
         sed -i '/^LIBAI_APP_DATA_DIR=/d' .env.deploy
-        sed -i '/^# LIBAI_APP_DATA_DIR=/d' .env.deploy
+        sed -i '/^# *LIBAI_APP_DATA_DIR=/d' .env.deploy
     fi
 
-    # 基础配置
-    sed -i "s|^LIBAI_CORS_ORIGINS=.*|LIBAI_CORS_ORIGINS=|" .env.deploy
-
-    # 存储配置
+    # 存储公网地址
     if [[ "$STORAGE_METHOD" == "local" ]]; then
-        get_server_ip
-        sed -i "s|^LIBAI_PUBLIC_BASE_URL=.*|LIBAI_PUBLIC_BASE_URL=http://$SERVER_IP:8765|" .env.deploy
+        set_public_base_url
     fi
 
     ok "环境变量配置完成"
 }
 
 configure_env_domain() {
-    info "更新环境变量为域名模式..."
+    info "更新存储公网地址为域名..."
     cd "$INSTALL_DIR"
-    sed -i "s|^LIBAI_PUBLIC_BASE_URL=.*|LIBAI_PUBLIC_BASE_URL=https://$DOMAIN|" .env.deploy
-    sed -i "s|^LIBAI_CORS_ORIGINS=.*|LIBAI_CORS_ORIGINS=https://$DOMAIN|" .env.deploy
-    ok "环境变量已更新"
+    [[ "$STORAGE_METHOD" == "local" ]] && set_public_base_url
+    ok "已更新"
 }
 
-configure_web_config_ip() {
-    info "配置前端（IP 模式）..."
-    get_server_ip
-    sed -i "s|window.__LIBAI_BACKEND_BASE_URL__ = .*|window.__LIBAI_BACKEND_BASE_URL__ = \"http://$SERVER_IP:8765\";|" web/config.js
-    ok "前端配置完成"
+# 设置 .env.deploy 里的键值（存在则替换，否则追加）
+set_env_var() {
+    local key=$1 val=$2
+    cd "$INSTALL_DIR"
+    if grep -q "^${key}=" .env.deploy; then
+        sed -i "s|^${key}=.*|${key}=${val}|" .env.deploy
+    else
+        echo "${key}=${val}" >> .env.deploy
+    fi
 }
 
-configure_web_config_domain() {
-    info "配置前端（域名模式）..."
+# 前端永远用同源：window.location.origin
+configure_web_config_origin() {
+    info "配置前端为同源访问..."
+    cd "$INSTALL_DIR"
     sed -i 's|window.__LIBAI_BACKEND_BASE_URL__ = .*|window.__LIBAI_BACKEND_BASE_URL__ = window.location.origin;|' web/config.js
-    ok "前端配置完成"
+    ok "前端配置完成（同源，IP/域名自动适配）"
 }
 
+# ---------- 依赖安装 ----------
 install_docker() {
     info "检查 Docker..."
-    if command -v docker &>/dev/null && command -v docker compose &>/dev/null; then
-        ok "Docker 已安装"
+    if command -v docker &>/dev/null && docker compose version &>/dev/null; then
+        ok "Docker 已就绪"
         return
     fi
     info "安装 Docker..."
     apt-get update -qq
     apt-get install -y -qq curl ca-certificates gnupg lsb-release
-    mkdir -p /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg 2>/dev/null || \
-    curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg 2>/dev/null
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$(lsb_release -is | tr '[:upper:]' '[:lower:]') $(lsb_release -cs) stable" \
-        | tee /etc/apt/sources.list.d/docker.list >/dev/null
+    install -m 0755 -d /etc/apt/keyrings
+    local distro
+    distro=$(lsb_release -is 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    [[ "$distro" != "ubuntu" && "$distro" != "debian" ]] && distro="debian"
+    curl -fsSL "https://download.docker.com/linux/$distro/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$distro $(lsb_release -cs) stable" \
+        > /etc/apt/sources.list.d/docker.list
     apt-get update -qq
     apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
     systemctl enable --now docker
@@ -677,165 +683,236 @@ install_systemd_deps() {
     ok "依赖安装完成"
 }
 
-install_nginx_if_needed() {
+install_nginx_pkg() {
     if command -v nginx &>/dev/null; then
         ok "Nginx 已安装"
         return
     fi
     info "安装 Nginx..."
     apt-get update -qq
-    apt-get install -y -qq nginx certbot python3-certbot-nginx
+    apt-get install -y -qq nginx
     systemctl enable nginx
     ok "Nginx 安装完成"
 }
 
-start_docker_no_nginx() {
-    info "启动 Docker 服务（仅后端，暴露 8765）..."
+# ---------- Docker 启动 ----------
+regen_compose() {
     cd "$INSTALL_DIR"
-
-    # 检测端口冲突（修复 address already in use）
-    if check_port 8765; then
-        cleanup_port 8765 || warn "端口 8765 清理失败，启动可能失败"
-    fi
-
-    # 清理可能残留的旧容器和网络（修复 Docker 网络状态不一致）
-    docker compose down 2>/dev/null || true
-    docker ps -a --format '{{.Names}}' | grep -i libai | xargs -r docker rm -f 2>/dev/null || true
-    docker network prune -f 2>/dev/null || true
-
-    # 生成临时 compose（不含 nginx）
-    cat > docker-compose.override.yml <<'EOF'
-services:
-  backend:
-    ports:
-      - "8765:8765"
-EOF
-
-    docker compose up -d --build backend
-    ok "Docker 后端已启动"
-
-    # 启动前端静态服务
-    info "启动前端静态服务（5180）..."
-    if check_port 5180; then
-        cleanup_port 5180 || true
-    fi
-    cd web
-    nohup python3 -m http.server 5180 > /tmp/libai-frontend.log 2>&1 &
-    echo $! > /tmp/libai-frontend.pid
-    ok "前端服务已启动"
+    sed -e "s|__WEB_PORT__|$WEB_PORT|g" \
+        -e "s|__BACKEND_PORT__|$BACKEND_PORT|g" \
+        deploy/docker-compose.libai.yml.tpl > deploy/docker-compose.libai.yml
 }
 
-restart_docker_with_nginx() {
-    info "启动完整 Docker 服务（含 Nginx）..."
+start_docker() {
+    info "启动 Docker（后端回环 + Nginx 入口 $WEB_PORT）..."
     cd "$INSTALL_DIR"
 
-    # 删除 override，使用完整 compose
-    rm -f docker-compose.override.yml
+    # 生成运行时 nginx 配置（HTTP，容器内监听 80）
+    gen_nginx_http_docker
 
-    # 停掉临时前端
-    if [[ -f /tmp/libai-frontend.pid ]]; then
-        kill $(cat /tmp/libai-frontend.pid) 2>/dev/null || true
-        rm -f /tmp/libai-frontend.pid
-    fi
+    # 生成 compose
+    regen_compose
 
-    docker compose up -d --build
-    ok "Docker 服务已启动（含 Nginx）"
+    # 清理可能的旧容器
+    docker compose -f deploy/docker-compose.libai.yml down 2>/dev/null || true
+
+    docker compose -f deploy/docker-compose.libai.yml up -d --build
+    ok "Docker 服务已启动"
 }
 
-start_systemd_backend_only() {
+# 生成 Docker 版运行时 nginx 配置
+gen_nginx_http_docker() {
+    cd "$INSTALL_DIR"
+    mkdir -p deploy/nginx/runtime
+    sed -e "s|__LISTEN__|80|g" \
+        -e "s|__SERVER_NAME__|_|g" \
+        -e "s|__ROOT__|/usr/share/nginx/html|g" \
+        -e "s|__BACKEND__|backend:$BACKEND_PORT|g" \
+        -e "s|__INCLUDE__|/etc/nginx/conf.d/_libai_proxy.inc|g" \
+        deploy/nginx/libai.http.conf > deploy/nginx/runtime/libai.conf
+    cp deploy/nginx/_libai_proxy.inc deploy/nginx/runtime/_libai_proxy.inc
+}
+
+# ---------- systemd 启动 ----------
+start_systemd() {
     info "安装 Python 依赖..."
     cd "$INSTALL_DIR"
     python3 -m venv .venv
+    .venv/bin/pip install --quiet --upgrade pip
     .venv/bin/pip install --quiet -r requirements.txt
 
-    info "创建 libai 用户..."
+    info "创建 libai 用户与数据目录..."
     useradd -r -s /usr/sbin/nologin libai 2>/dev/null || true
-
-    # 确保数据目录存在并赋权（修复 PermissionError）
     mkdir -p "$INSTALL_DIR/data"
     chown -R libai:libai "$INSTALL_DIR/data"
 
-    info "安装 systemd 服务..."
-    sed -i "s|/opt/libai-canvas-web|$INSTALL_DIR|g" deploy/systemd/libai-backend.service
-    cp deploy/systemd/libai-backend.service /etc/systemd/system/
+    info "安装后端 systemd 服务..."
+    sed "s|/opt/libai-canvas-web|$INSTALL_DIR|g" deploy/systemd/libai-backend.service \
+        > /etc/systemd/system/libai-backend.service
     systemctl daemon-reload
     systemctl enable --now libai-backend
 
-    # 等待并验证后端启动
     info "等待后端启动..."
     sleep 3
     if systemctl is-active --quiet libai-backend; then
-        ok "后端服务已启动"
+        ok "后端已启动（回环 127.0.0.1:$BACKEND_PORT）"
     else
-        warn "后端启动异常，查看日志：journalctl -u libai-backend -n 30"
+        warn "后端启动异常，最近日志："
         journalctl -u libai-backend -n 15 --no-pager || true
     fi
 
-    # 启动前端
-    info "启动前端静态服务（5180）..."
-    cd web
-    nohup python3 -m http.server 5180 > /tmp/libai-frontend.log 2>&1 &
-    echo $! > /tmp/libai-frontend.pid
-    ok "前端服务已启动"
+    info "配置 Nginx 入口（端口 $WEB_PORT）..."
+    regen_nginx_http_systemd
+    nginx -t && systemctl reload nginx
+    ok "Nginx 入口已就绪"
 }
 
-configure_nginx_docker() {
-    info "配置 Nginx（Docker 版）..."
+# 生成/更新 systemd 版 HTTP nginx 配置
+regen_nginx_http_systemd() {
     cd "$INSTALL_DIR"
-    sed -i "s|your-domain.com|$DOMAIN|g" deploy/nginx/libai.conf
-    mkdir -p deploy/certs
-    ok "Nginx 配置完成"
+    cp deploy/nginx/_libai_proxy.host.inc /etc/nginx/snippets/_libai_proxy.inc
+    sed -e "s|__LISTEN__|$WEB_PORT|g" \
+        -e "s|__SERVER_NAME__|_|g" \
+        -e "s|__ROOT__|$INSTALL_DIR/web|g" \
+        -e "s|__BACKEND__|127.0.0.1:$BACKEND_PORT|g" \
+        -e "s|__INCLUDE__|/etc/nginx/snippets/_libai_proxy.inc|g" \
+        deploy/nginx/libai.http.conf > /etc/nginx/sites-available/libai.conf
+    ln -sf /etc/nginx/sites-available/libai.conf /etc/nginx/sites-enabled/libai.conf
 }
 
-configure_nginx_systemd() {
-    info "配置 Nginx（systemd 版）..."
-    cd "$INSTALL_DIR"
+# ---------- HTTPS ----------
+detect_existing_cert() {
+    local paths=(
+        "/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+        "/etc/nginx/ssl/$DOMAIN/fullchain.pem"
+        "/etc/ssl/$DOMAIN/fullchain.pem"
+        "$INSTALL_DIR/deploy/certs/fullchain.pem"
+    )
+    for p in "${paths[@]}"; do
+        if [[ -f "$p" ]]; then
+            CERT_FULLCHAIN="$p"
+            CERT_KEY="${p/fullchain.pem/privkey.pem}"
+            [[ -f "$CERT_KEY" ]] && return 0
+        fi
+    done
+    return 1
+}
 
-    # 停掉临时前端
-    if [[ -f /tmp/libai-frontend.pid ]]; then
-        kill $(cat /tmp/libai-frontend.pid) 2>/dev/null || true
-        rm -f /tmp/libai-frontend.pid
+request_cert_letsencrypt() {
+    info "申请 Let's Encrypt 证书（standalone，临时占用 80）..."
+    command -v certbot &>/dev/null || apt-get install -y -qq certbot
+
+    if port_in_use 80; then
+        warn "80 端口被占用，无法用 standalone 模式申请证书"
+        warn "请释放 80 端口后重试，或选手动放置证书"
+        return 1
     fi
 
-    sed -i "s|your-domain.com|$DOMAIN|g" deploy/nginx/libai.systemd.conf
-    sed -i "s|/opt/libai-canvas-web|$INSTALL_DIR|g" deploy/nginx/libai.systemd.conf
-    cp deploy/nginx/libai.systemd.conf /etc/nginx/sites-available/libai.conf
-    cp deploy/nginx/_libai_proxy.host.inc /etc/nginx/snippets/_libai_proxy.inc
-    ln -sf /etc/nginx/sites-available/libai.conf /etc/nginx/sites-enabled/
-    rm -f /etc/nginx/sites-enabled/default
-    ok "Nginx 配置完成"
-}
-
-request_cert_docker() {
-    info "申请 Let's Encrypt 证书..."
-    cd "$INSTALL_DIR"
-
-    # 临时 80 端口 webroot
-    docker run --rm -d --name certbot-temp -p 80:80 -v "$INSTALL_DIR/web:/usr/share/nginx/html:ro" nginx:alpine
-    sleep 2
-
-    docker run --rm \
-        -v "$INSTALL_DIR/deploy/certs:/etc/letsencrypt" \
-        -v "$INSTALL_DIR/web:/usr/share/nginx/html" \
-        certbot/certbot certonly --webroot \
-        -w /usr/share/nginx/html \
+    certbot certonly --standalone \
         -d "$DOMAIN" \
         --email "admin@$DOMAIN" \
-        --agree-tos \
-        --non-interactive || error "证书申请失败"
-
-    docker stop certbot-temp 2>/dev/null || true
-
-    cp "$INSTALL_DIR/deploy/certs/live/$DOMAIN/fullchain.pem" "$INSTALL_DIR/deploy/certs/"
-    cp "$INSTALL_DIR/deploy/certs/live/$DOMAIN/privkey.pem" "$INSTALL_DIR/deploy/certs/"
-
+        --agree-tos --non-interactive || return 1
     ok "证书申请完成"
+    return 0
 }
 
-request_cert_systemd() {
-    info "申请 Let's Encrypt 证书..."
-    certbot --nginx -d "$DOMAIN" --email "admin@$DOMAIN" --agree-tos --non-interactive --redirect || error "证书申请失败"
-    ok "证书申请完成"
+apply_https_systemd() {
+    info "应用 HTTPS 配置（systemd Nginx）..."
+    cd "$INSTALL_DIR"
+    cp deploy/nginx/_libai_proxy.host.inc /etc/nginx/snippets/_libai_proxy.inc
+    gen_https_conf "$INSTALL_DIR/web" "127.0.0.1:$BACKEND_PORT" "/etc/nginx/snippets/_libai_proxy.inc" \
+        > /etc/nginx/sites-available/libai.conf
+    ln -sf /etc/nginx/sites-available/libai.conf /etc/nginx/sites-enabled/libai.conf
+    nginx -t && systemctl reload nginx || error "Nginx 配置错误"
+    ok "HTTPS 已启用"
+}
+
+apply_https_docker() {
+    info "应用 HTTPS 配置（Docker Nginx）..."
+    cd "$INSTALL_DIR"
+    mkdir -p deploy/nginx/runtime deploy/certs
+
+    # 证书拷进项目目录供容器挂载
+    if [[ "$CERT_FULLCHAIN" != "$INSTALL_DIR/deploy/certs/fullchain.pem" ]]; then
+        cp "$CERT_FULLCHAIN" deploy/certs/fullchain.pem
+        cp "$CERT_KEY" deploy/certs/privkey.pem
+    fi
+
+    cp deploy/nginx/_libai_proxy.inc deploy/nginx/runtime/_libai_proxy.inc
+    gen_https_conf "/usr/share/nginx/html" "backend:$BACKEND_PORT" "/etc/nginx/conf.d/_libai_proxy.inc" \
+        > deploy/nginx/runtime/libai.conf
+
+    regen_compose
+    docker compose -f deploy/docker-compose.libai.yml up -d
+    ok "HTTPS 已启用"
+}
+
+# 生成 HTTPS nginx 配置到 stdout
+# $1=root  $2=backend  $3=include路径
+gen_https_conf() {
+    local root=$1 backend=$2 inc=$3
+    local cert_path key_path
+    if [[ "$DEPLOY_METHOD" == "docker" ]]; then
+        cert_path="/etc/nginx/certs/fullchain.pem"
+        key_path="/etc/nginx/certs/privkey.pem"
+    else
+        cert_path="$CERT_FULLCHAIN"
+        key_path="$CERT_KEY"
+    fi
+
+    cat <<EOF
+# HTTP：跳转 HTTPS（同时保留 acme 校验目录）
+server {
+    listen ${WEB_PORT};
+    server_name ${DOMAIN};
+    location /.well-known/acme-challenge/ { root ${root}; }
+    return 301 https://\$host:${HTTPS_PORT}\$request_uri;
+}
+
+server {
+    listen ${HTTPS_PORT} ssl;
+    http2 on;
+    server_name ${DOMAIN};
+
+    ssl_certificate     ${cert_path};
+    ssl_certificate_key ${key_path};
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+
+    root ${root};
+    index index.html;
+    client_max_body_size 200m;
+
+    location ~ ^/(health|jobs|newapi|providers|provider-models|projects|history|prompts|media|jianying|desktop-announcements|design-space)(/|\$) {
+        proxy_pass http://${backend};
+        include ${inc};
+    }
+    location = /assets        { proxy_pass http://${backend}; include ${inc}; }
+    location = /assets/write  { proxy_pass http://${backend}; include ${inc}; }
+    location = /assets/import { proxy_pass http://${backend}; include ${inc}; }
+    location ~ ^/assets/[^/]+\$ {
+        if (\$uri ~* \.(js|mjs|css|png|jpg|jpeg|gif|svg|webp|ico|woff2?|ttf|map)\$) { break; }
+        proxy_pass http://${backend};
+        include ${inc};
+    }
+    location ~ ^/assets/[^/]+/(thumb|delete|promote)\$ {
+        proxy_pass http://${backend};
+        include ${inc};
+    }
+    location / {
+        try_files \$uri \$uri/ /index.html;
+    }
+}
+EOF
+}
+
+restart_backend() {
+    cd "$INSTALL_DIR"
+    if [[ "$DEPLOY_METHOD" == "docker" ]]; then
+        docker compose -f deploy/docker-compose.libai.yml restart backend
+    else
+        systemctl restart libai-backend
+    fi
 }
 
 # ========== 入口 ==========

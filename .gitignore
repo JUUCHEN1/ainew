@@ -9,6 +9,11 @@ server/backend/reference-storage.env
 # ===== 部署证书（私钥绝不入库）=====
 deploy/certs/
 
+# ===== manage.sh 运行时渲染产物（由 .tpl 模板生成，不入库）=====
+deploy/docker-compose.libai.yml
+deploy/docker-compose.libai.rendered.yml
+deploy/nginx/runtime/
+
 # ===== 运行时数据 / 数据库 =====
 data/
 *.sqlite3
