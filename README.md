@@ -6,6 +6,32 @@
 
 ---
 
+## 🚀 一键部署到云 VPS（小白友好）
+
+**复制以下命令到你的 Ubuntu/Debian VPS，一路回答问题即可完成部署：**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JUUCHEN1/ainew/main/install.sh | sudo bash
+```
+
+或先下载再运行：
+```bash
+wget https://raw.githubusercontent.com/JUUCHEN1/ainew/main/install.sh
+sudo bash install.sh
+```
+
+脚本会交互式引导你选择：
+- 部署方式（Docker 或 systemd）
+- 域名（必须已解析到 VPS IP）
+- HTTPS 证书（自动申请 Let's Encrypt 或手动放置）
+- 参考图存储（本机自托管 / S3 / 图床）
+
+全自动完成：装依赖、配置、证书、启动服务。部署完直接访问 `https://你的域名`。
+
+> 高级用户或需要手动控制每一步，请看 [deploy/README.md](deploy/README.md)。
+
+---
+
 ## 为什么能直接 Web 化
 
 逆向原应用后确认：**前端构建产物本身就内置了浏览器运行分支**。
