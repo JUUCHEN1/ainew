@@ -2,12 +2,13 @@
 # ============================================================
 # 漫创AI Web · 一键安装部署脚本（Ubuntu/Debian）
 # ------------------------------------------------------------
-# 交互式引导，小白友好：问答 → 自动装依赖 → 配置 → 启动
+# 注意：此脚本为旧版简化安装脚本，已被 manage.sh 替代。
+# 推荐使用 manage.sh，提供菜单式管理、分步配置、灵活部署。
 #
-# 用法：
-#   curl -fsSL https://raw.githubusercontent.com/JUUCHEN1/ainew/main/install.sh | bash
-#   或：wget -qO- https://raw.githubusercontent.com/JUUCHEN1/ainew/main/install.sh | bash
-#   或：git clone <仓库> && cd libai-canvas-web && bash install.sh
+# 获取新脚本：
+#   curl -fsSL https://raw.githubusercontent.com/JUUCHEN1/ainew/main/manage.sh | sudo bash
+#
+# 本脚本保留供需要一次性全自动部署（含域名+证书）的场景使用。
 # ============================================================
 set -e
 

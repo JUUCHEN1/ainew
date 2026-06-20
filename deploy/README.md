@@ -5,18 +5,32 @@
 
 ---
 
-## 🚀 快速开始：一键安装脚本（推荐小白）
+## 🚀 快速开始：管理脚本（推荐小白）
 
-如果你是第一次部署，推荐用一键脚本，交互式引导，全自动完成：
+如果你是第一次部署，推荐用管理脚本，菜单式操作，灵活可控：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/JUUCHEN1/ainew/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/JUUCHEN1/ainew/main/manage.sh | sudo bash
 ```
 
-脚本会问你几个问题（部署方式、域名、证书、存储），然后自动装依赖、配置、启动服务。
-部署完直接访问 `https://你的域名`。
+或下载后反复使用：
+```bash
+wget https://raw.githubusercontent.com/JUUCHEN1/ainew/main/manage.sh
+sudo bash manage.sh
+```
 
-**下面是手动部署指南**，适合想精确控制每一步、或一键脚本失败需要排查的情况。
+**菜单功能：**
+- **1) 全新安装** — 仅部署服务，暴露端口（后端 8765 / 前端 5180），用 IP 访问，跳过域名
+- **2) 配置域名和 HTTPS** — 随时补配 Nginx + Let's Encrypt 证书，支持已有 Nginx
+- **3) 修改存储方式** — 本地自托管 / S3 / 图床，随时切换
+- **4-7) 状态/重启/日志/卸载** — 完整管理
+
+**典型流程：**
+1. 首次运行选"1"先把服务跑起来 → 用 `http://VPS_IP:5180` 验证功能
+2. 域名准备好后，再次运行选"2" → 输入域名，自动配 Nginx + 证书，无需重装
+3. 后续随时运行脚本修改配置 / 查看日志 / 重启
+
+**下面是手动部署指南**，适合想精确控制每一步、或脚本失败需要排查的情况。
 
 ---
 

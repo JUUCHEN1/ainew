@@ -8,25 +8,28 @@
 
 ## 🚀 一键部署到云 VPS（小白友好）
 
-**复制以下命令到你的 Ubuntu/Debian VPS，一路回答问题即可完成部署：**
+**复制以下命令到你的 Ubuntu/Debian VPS，菜单式管理部署：**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/JUUCHEN1/ainew/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/JUUCHEN1/ainew/main/manage.sh | sudo bash
 ```
 
-或先下载再运行：
+或先下载再运行（推荐，可反复使用）：
 ```bash
-wget https://raw.githubusercontent.com/JUUCHEN1/ainew/main/install.sh
-sudo bash install.sh
+wget https://raw.githubusercontent.com/JUUCHEN1/ainew/main/manage.sh
+sudo bash manage.sh
 ```
 
-脚本会交互式引导你选择：
-- 部署方式（Docker 或 systemd）
-- 域名（必须已解析到 VPS IP）
-- HTTPS 证书（自动申请 Let's Encrypt 或手动放置）
-- 参考图存储（本机自托管 / S3 / 图床）
+**菜单功能：**
+1. **全新安装** — 仅部署后端+前端，暴露端口（8765/5180），直接 IP 访问，跳过域名配置
+2. **配置域名和 HTTPS** — 部署完后随时配置，生成 Nginx 配置 + 自动申请证书
+3. **修改存储方式** — 本机自托管 / S3 / 图床，随时切换
+4. **查看状态 / 重启 / 日志 / 卸载** — 完整管理
 
-全自动完成：装依赖、配置、证书、启动服务。部署完直接访问 `https://你的域名`。
+**灵活部署流程：**
+- 首次运行选"1"先把服务跑起来，用 `http://IP:5180` 验证功能
+- 域名准备好后，再次运行脚本选"2"配置 HTTPS，无需重装
+- 已有 Nginx 服务？脚本会检测并复用，不会冲突
 
 > 高级用户或需要手动控制每一步，请看 [deploy/README.md](deploy/README.md)。
 
