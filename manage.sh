@@ -668,15 +668,7 @@ main() {
     check_root
     check_system
     load_state
-
-    # 首次运行且未安装，直接进安装
-    if [[ "$INSTALLED" != "true" ]] && [[ ! -t 0 ]]; then
-        # 管道模式（curl | bash），走快速安装
-        do_install
-    else
-        # 交互模式，显示菜单
-        show_menu
-    fi
+    show_menu
 }
 
 main "$@"
