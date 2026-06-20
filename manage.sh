@@ -418,7 +418,7 @@ do_change_port() {
 
     if [[ "$DEPLOY_METHOD" == "docker" ]]; then
         regen_compose
-        docker compose -f deploy/docker-compose.libai.yml up -d
+        docker compose -f docker-compose.libai.yml up -d
     else
         regen_nginx_http_systemd
         nginx -t && systemctl reload nginx
@@ -483,7 +483,7 @@ do_status() {
     get_server_ip
 
     if [[ "$DEPLOY_METHOD" == "docker" ]]; then
-        docker compose -f deploy/docker-compose.libai.yml ps
+        docker compose -f docker-compose.libai.yml ps
     else
         echo "— 后端 —"
         systemctl status libai-backend --no-pager -l | head -8 || true
@@ -515,7 +515,7 @@ do_restart() {
     cd "$INSTALL_DIR"
 
     if [[ "$DEPLOY_METHOD" == "docker" ]]; then
-        docker compose -f deploy/docker-compose.libai.yml restart
+        docker compose -f docker-compose.libai.yml restart
         ok "Docker 服务已重启"
     else
         systemctl restart libai-backend
@@ -538,7 +538,7 @@ do_logs() {
     cd "$INSTALL_DIR"
 
     if [[ "$DEPLOY_METHOD" == "docker" ]]; then
-        docker compose -f deploy/docker-compose.libai.yml logs -f --tail=100
+        docker compose -f docker-compose.libai.yml logs -f --tail=100
     else
         journalctl -u libai-backend -f -n 100
     fi
@@ -564,7 +564,7 @@ do_uninstall() {
     cd "$INSTALL_DIR" 2>/dev/null || true
 
     if [[ "$DEPLOY_METHOD" == "docker" ]]; then
-        docker compose -f deploy/docker-compose.libai.yml down -v 2>/dev/null || true
+        docker compose -f docker-compose.libai.yml down -v 2>/dev/null || true
     else
         systemctl stop libai-backend 2>/dev/null || true
         systemctl disable libai-backend 2>/dev/null || true
@@ -723,9 +723,11 @@ install_nginx_pkg() {
 # ---------- Docker 启动 ----------
 regen_compose() {
     cd "$INSTALL_DIR"
+    # 渲染到项目根目录：compose 内的相对路径（.env.deploy、./web、./data、
+    # ./deploy/nginx/runtime）都以 compose 文件所在目录为基准，必须放根目录。
     sed -e "s|__WEB_PORT__|$WEB_PORT|g" \
         -e "s|__BACKEND_PORT__|$BACKEND_PORT|g" \
-        deploy/docker-compose.libai.yml.tpl > deploy/docker-compose.libai.yml
+        deploy/docker-compose.libai.yml.tpl > docker-compose.libai.yml
 }
 
 start_docker() {
@@ -739,9 +741,9 @@ start_docker() {
     regen_compose
 
     # 清理可能的旧容器
-    docker compose -f deploy/docker-compose.libai.yml down 2>/dev/null || true
+    docker compose -f docker-compose.libai.yml down 2>/dev/null || true
 
-    docker compose -f deploy/docker-compose.libai.yml up -d --build
+    docker compose -f docker-compose.libai.yml up -d --build
     ok "Docker 服务已启动"
 }
 
@@ -868,7 +870,7 @@ apply_https_docker() {
         > deploy/nginx/runtime/libai.conf
 
     regen_compose
-    docker compose -f deploy/docker-compose.libai.yml up -d
+    docker compose -f docker-compose.libai.yml up -d
     ok "HTTPS 已启用"
 }
 
@@ -934,7 +936,7 @@ EOF
 restart_backend() {
     cd "$INSTALL_DIR"
     if [[ "$DEPLOY_METHOD" == "docker" ]]; then
-        docker compose -f deploy/docker-compose.libai.yml restart backend
+        docker compose -f docker-compose.libai.yml restart backend
     else
         systemctl restart libai-backend
     fi

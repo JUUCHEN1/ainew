@@ -10,6 +10,7 @@ server/backend/reference-storage.env
 deploy/certs/
 
 # ===== manage.sh 运行时渲染产物（由 .tpl 模板生成，不入库）=====
+docker-compose.libai.yml
 deploy/docker-compose.libai.yml
 deploy/docker-compose.libai.rendered.yml
 deploy/nginx/runtime/
