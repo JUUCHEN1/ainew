@@ -54,7 +54,7 @@ ask_deploy_method() {
     info "请选择部署方式："
     echo "  1) Docker + Compose（推荐小白，一条命令起，环境隔离）"
     echo "  2) systemd + Nginx（不装 Docker，资源最省）"
-    read -p "请输入 1 或 2: " DEPLOY_METHOD
+    read -p "请输入 1 或 2: " DEPLOY_METHOD </dev/tty
     case "$DEPLOY_METHOD" in
         1) DEPLOY_METHOD="docker" ;;
         2) DEPLOY_METHOD="systemd" ;;
@@ -66,7 +66,7 @@ ask_deploy_method() {
 # ---- 询问域名 ----
 ask_domain() {
     echo ""
-    read -p "请输入你的域名（例 ai.example.com，必须已解析到本机 IP）: " DOMAIN
+    read -p "请输入你的域名（例 ai.example.com，必须已解析到本机 IP）: " DOMAIN </dev/tty
     [[ -z "$DOMAIN" ]] && error "域名不能为空"
     ok "域名: $DOMAIN"
 }
@@ -77,7 +77,7 @@ ask_cert_method() {
     info "HTTPS 证书获取方式："
     echo "  1) 自动申请 Let's Encrypt（推荐，域名必须已解析到本机 IP）"
     echo "  2) 手动放置（稍后把 fullchain.pem 和 privkey.pem 放到指定目录）"
-    read -p "请输入 1 或 2: " CERT_METHOD
+    read -p "请输入 1 或 2: " CERT_METHOD </dev/tty
     case "$CERT_METHOD" in
         1) CERT_METHOD="auto" ;;
         2) CERT_METHOD="manual" ;;
@@ -93,7 +93,7 @@ ask_storage() {
     echo "  1) VPS 本机自托管（推荐，不依赖外部图床）"
     echo "  2) S3 / 腾讯云 COS（需填写凭据）"
     echo "  3) 自定义图床（需填写上传接口 URL）"
-    read -p "请输入 1/2/3: " STORAGE_METHOD
+    read -p "请输入 1/2/3: " STORAGE_METHOD </dev/tty
     case "$STORAGE_METHOD" in
         1) STORAGE_METHOD="local" ;;
         2) STORAGE_METHOD="s3" ;;
@@ -112,7 +112,7 @@ confirm() {
     echo "  - 配置环境变量、Nginx、证书"
     echo "  - 启动服务"
     echo ""
-    read -p "确认开始？(y/N): " CONFIRM
+    read -p "确认开始？(y/N): " CONFIRM </dev/tty
     [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]] && { info "已取消"; exit 0; }
 }
 
@@ -208,7 +208,7 @@ configure_nginx_systemd() {
 request_cert_docker() {
     if [[ "$CERT_METHOD" == "manual" ]]; then
         warn "请手动放置证书到 /opt/libai-canvas-web/deploy/certs/fullchain.pem 和 privkey.pem"
-        read -p "放置完成后按回车继续..."
+        read -p "放置完成后按回车继续..." </dev/tty
         return
     fi
 
@@ -241,7 +241,7 @@ request_cert_docker() {
 request_cert_systemd() {
     if [[ "$CERT_METHOD" == "manual" ]]; then
         warn "请手动放置证书，然后在 /etc/nginx/sites-available/libai.conf 里配置路径"
-        read -p "配置完成后按回车继续..."
+        read -p "配置完成后按回车继续..." </dev/tty
         return
     fi
 
