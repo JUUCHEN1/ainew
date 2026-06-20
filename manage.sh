@@ -720,6 +720,22 @@ install_nginx_pkg() {
     ok "Nginx 安装完成"
 }
 
+# 移除监听 80 的默认站点，避免与已有的 Docker Nginx（占 80）撞车导致整个
+# 宿主机 Nginx 起不来。本项目只用自定义端口，不需要默认站点。
+disable_default_nginx_site() {
+    local removed=0
+    if [[ -e /etc/nginx/sites-enabled/default ]]; then
+        rm -f /etc/nginx/sites-enabled/default
+        removed=1
+    fi
+    # 某些镜像默认配置在 conf.d/default.conf
+    if [[ -e /etc/nginx/conf.d/default.conf ]] && grep -q "listen\s*80" /etc/nginx/conf.d/default.conf 2>/dev/null; then
+        mv /etc/nginx/conf.d/default.conf /etc/nginx/conf.d/default.conf.disabled 2>/dev/null || true
+        removed=1
+    fi
+    [[ "$removed" == "1" ]] && info "已禁用 Nginx 默认站点（释放 80，避免与现有服务冲突）"
+}
+
 # ---------- Docker 启动 ----------
 regen_compose() {
     cd "$INSTALL_DIR"
@@ -789,9 +805,20 @@ start_systemd() {
     fi
 
     info "配置 Nginx 入口（端口 $WEB_PORT）..."
+    disable_default_nginx_site
     regen_nginx_http_systemd
-    nginx -t && systemctl reload nginx
-    ok "Nginx 入口已就绪"
+    if ! nginx -t; then
+        error "Nginx 配置测试失败，请检查 /etc/nginx/sites-available/libai.conf"
+    fi
+    # nginx 可能尚未运行（reload 会失败），用 restart 更稳；失败则提示
+    if systemctl restart nginx; then
+        ok "Nginx 入口已就绪"
+    else
+        warn "Nginx 启动失败，可能是端口冲突。最近日志："
+        journalctl -u nginx -n 15 --no-pager || true
+        warn "若 80 端口被其他服务（如 Docker Nginx）占用，本项目用的是 $WEB_PORT，"
+        warn "请确认没有其他宿主机站点也在抢 80；必要时检查 /etc/nginx/sites-enabled/"
+    fi
 }
 
 # 生成/更新 systemd 版 HTTP nginx 配置
@@ -910,22 +937,28 @@ server {
     index index.html;
     client_max_body_size 200m;
 
+    # 1) 前端打包静态资源：带扩展名的 /assets/xxx.js|css|... 直接读磁盘
+    location ~* ^/assets/.+\.(js|mjs|css|png|jpg|jpeg|gif|svg|webp|ico|woff2?|ttf|map)\$ {
+        try_files \$uri =404;
+    }
+    # 2) 后端 API 固定前缀
     location ~ ^/(health|jobs|newapi|providers|provider-models|projects|history|prompts|media|jianying|desktop-announcements|design-space)(/|\$) {
         proxy_pass http://${backend};
         include ${inc};
     }
+    # 3) 后端 /assets API
     location = /assets        { proxy_pass http://${backend}; include ${inc}; }
     location = /assets/write  { proxy_pass http://${backend}; include ${inc}; }
     location = /assets/import { proxy_pass http://${backend}; include ${inc}; }
-    location ~ ^/assets/[^/]+\$ {
-        if (\$uri ~* \.(js|mjs|css|png|jpg|jpeg|gif|svg|webp|ico|woff2?|ttf|map)\$) { break; }
-        proxy_pass http://${backend};
-        include ${inc};
-    }
     location ~ ^/assets/[^/]+/(thumb|delete|promote)\$ {
         proxy_pass http://${backend};
         include ${inc};
     }
+    location ~ ^/assets/[^/]+\$ {
+        proxy_pass http://${backend};
+        include ${inc};
+    }
+    # 4) 前端 SPA 回退
     location / {
         try_files \$uri \$uri/ /index.html;
     }
