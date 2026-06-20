@@ -115,6 +115,53 @@ pick_free_port() {
     echo "$p"
 }
 
+# ---- 检测本机是否已有 nginx / 反向代理占着 80（用于推荐接入模式）----
+# 返回 0 表示检测到已有反代，并把描述写入 DETECTED_PROXY_DESC。
+detect_existing_proxy() {
+    DETECTED_PROXY_DESC=""
+    # 1) 宿主机 nginx
+    if command -v nginx &>/dev/null; then
+        DETECTED_PROXY_DESC="宿主机 nginx"
+        return 0
+    fi
+    # 2) Docker 里的 nginx / 反代容器
+    if command -v docker &>/dev/null; then
+        local c
+        c=$(docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null \
+            | grep -Ei 'nginx|caddy|traefik|openresty' | awk '{print $1}' | head -1)
+        if [[ -n "$c" ]]; then
+            DETECTED_PROXY_DESC="Docker 容器「$c」"
+            return 0
+        fi
+    fi
+    # 3) 80 端口已被占用
+    if port_in_use 80; then
+        DETECTED_PROXY_DESC="某个服务（已占用 80 端口）"
+        return 0
+    fi
+    return 1
+}
+
+# ---- 根据访问模式计算 nginx 监听地址 ----
+# standalone：监听所有网卡（外网可经 IP:端口 直接访问）
+# proxy：只监听回环（仅本机前置反代可达，外网碰不到）
+web_listen_addr() {
+    if [[ "$ACCESS_MODE" == "proxy" ]]; then
+        echo "127.0.0.1:$WEB_PORT"
+    else
+        echo "$WEB_PORT"
+    fi
+}
+
+# ---- 根据访问模式计算 docker compose 的端口发布串 ----
+compose_publish() {
+    if [[ "$ACCESS_MODE" == "proxy" ]]; then
+        echo "127.0.0.1:$WEB_PORT:80"
+    else
+        echo "$WEB_PORT:80"
+    fi
+}
+
 # ---- 加载状态 ----
 load_state() {
     if [[ -f "$STATE_FILE" ]]; then
@@ -126,8 +173,10 @@ load_state() {
         DOMAIN=""
         STORAGE_METHOD=""
         WEB_PORT="$DEFAULT_PORT"
+        ACCESS_MODE="standalone"
     fi
     [[ -z "$WEB_PORT" ]] && WEB_PORT="$DEFAULT_PORT"
+    [[ -z "$ACCESS_MODE" ]] && ACCESS_MODE="standalone"
 }
 
 # ---- 保存状态 ----
@@ -139,6 +188,7 @@ DEPLOY_METHOD="$DEPLOY_METHOD"
 DOMAIN="$DOMAIN"
 STORAGE_METHOD="$STORAGE_METHOD"
 WEB_PORT="$WEB_PORT"
+ACCESS_MODE="$ACCESS_MODE"
 EOF
 }
 
@@ -149,9 +199,16 @@ show_menu() {
 
     if [[ "$INSTALLED" == "true" ]]; then
         get_server_ip
-        local access="http://$SERVER_IP:$WEB_PORT"
-        [[ -n "$DOMAIN" ]] && access="https://$DOMAIN"
-        echo -e "${GREEN}✓ 已安装${NC} | 方式: ${CYAN}$DEPLOY_METHOD${NC} | 端口: ${CYAN}$WEB_PORT${NC} | 访问: ${CYAN}$access${NC}"
+        local access
+        if [[ "$ACCESS_MODE" == "proxy" ]]; then
+            if [[ -n "$DOMAIN" ]]; then access="https://$DOMAIN（经你的反代）"
+            else access="经你的反代 → 127.0.0.1:$WEB_PORT"; fi
+        else
+            access="http://$SERVER_IP:$WEB_PORT"
+            [[ -n "$DOMAIN" ]] && access="https://$DOMAIN"
+        fi
+        local mode_label="独立入口"; [[ "$ACCESS_MODE" == "proxy" ]] && mode_label="接入反代"
+        echo -e "${GREEN}✓ 已安装${NC} | 方式: ${CYAN}$DEPLOY_METHOD/$mode_label${NC} | 端口: ${CYAN}$WEB_PORT${NC} | 访问: ${CYAN}$access${NC}"
     else
         echo -e "${YELLOW}未检测到安装${NC}"
     fi
@@ -212,12 +269,42 @@ do_install() {
     esac
     ok "部署方式: $DEPLOY_METHOD"
 
+    # 访问方式（独立入口 / 接入现有反代）
+    echo ""
+    info "请选择访问方式："
+    echo "  1) 独立入口：直接用 http://本机IP:端口 访问（适合没有域名 / 本机没有其它 Web 服务）"
+    echo "  2) 接入现有反代：本项目只监听回环，由你现有的 Nginx/反代用域名转发"
+    echo "                  （适合已有占用 80/443 的 Nginx，想统一走域名 + HTTPS）"
+    if detect_existing_proxy; then
+        echo ""
+        warn "检测到本机已有：${DETECTED_PROXY_DESC}（可能占用 80/443）"
+        info "→ 推荐选【2】接入现有反代，避免端口冲突，统一用域名访问。"
+        local mode_default=2
+    else
+        echo ""
+        info "未检测到其它 Web 服务 → 推荐选【1】独立入口，开箱即用。"
+        local mode_default=1
+    fi
+    read -p "请输入 1 或 2 [默认 $mode_default]: " amode </dev/tty
+    amode=$(echo "$amode" | tr -d '[:space:]')
+    amode="${amode:-$mode_default}"
+    case "$amode" in
+        1) ACCESS_MODE="standalone" ;;
+        2) ACCESS_MODE="proxy" ;;
+        *) error "无效选择" ;;
+    esac
+    ok "访问方式: $ACCESS_MODE"
+
     # 对外端口
     echo ""
     local suggest
     suggest=$(pick_free_port "$DEFAULT_PORT")
-    info "本项目 Nginx 对外端口（与你现有的 80/443 服务互不干扰）"
-    read -p "请输入对外端口 [默认 $suggest]: " input_port </dev/tty
+    if [[ "$ACCESS_MODE" == "proxy" ]]; then
+        info "本项目监听端口（仅回环 127.0.0.1，由你的反代转发到这里）"
+    else
+        info "本项目对外端口（直接 http://IP:此端口 访问）"
+    fi
+    read -p "请输入端口 [默认 $suggest]: " input_port </dev/tty
     input_port=$(echo "$input_port" | tr -d '[:space:]')
     WEB_PORT="${input_port:-$suggest}"
     if port_in_use "$WEB_PORT"; then
@@ -280,14 +367,90 @@ do_install() {
     ok "安装完成！"
     ok "========================================="
     echo ""
-    echo -e "  访问地址: ${GREEN}http://$SERVER_IP:$WEB_PORT${NC}"
-    echo ""
-    info "后端绑在回环 127.0.0.1:$BACKEND_PORT，外网无法直连，安全。"
-    info "准备好域名后，选菜单【2】加 HTTPS（config.js 无需改动）。"
+    if [[ "$ACCESS_MODE" == "proxy" ]]; then
+        info "接入模式：本项目只监听回环 ${CYAN}127.0.0.1:$WEB_PORT${NC}，外网无法直连。"
+        info "需要在你现有的 Nginx/反代里加一段，把域名转发到这里。"
+        echo ""
+        print_proxy_snippet
+        echo ""
+        info "贴好上面的配置并 reload 你的反代后，用域名访问即可。"
+    else
+        echo -e "  访问地址: ${GREEN}http://$SERVER_IP:$WEB_PORT${NC}"
+        echo ""
+        info "后端绑在回环 127.0.0.1:$BACKEND_PORT，外网无法直连，安全。"
+        info "准备好域名后，选菜单【2】加 HTTPS（config.js 无需改动）。"
+    fi
     info "以后管理本服务，终端直接输入：${GREEN}hb${NC}"
     echo ""
     read -p "按回车返回主菜单..." </dev/tty
     show_menu
+}
+
+# ---- 打印「接入现有反代」所需的配置片段 ----
+print_proxy_snippet() {
+    local backend_target="127.0.0.1:$WEB_PORT"
+    echo -e "${YELLOW}—————— 复制到你现有 Nginx 的站点配置（server 块内）——————${NC}"
+    cat <<EOF
+    # 漫创AI Web —— 反代到本项目入口（监听回环 $WEB_PORT）
+    location / {
+        proxy_pass http://$backend_target;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_http_version 1.1;
+        client_max_body_size 200m;
+    }
+EOF
+    echo -e "${YELLOW}—————————————————————————————————————————————————————${NC}"
+    info "提示：本项目 Nginx 已托管前端静态 + 后端 API，你的反代只需整体 proxy_pass 过来即可，无需单独挂载 web/ 目录。"
+}
+
+# ---- 打印「接入现有反代 + HTTPS」所需的完整 server 配置（域名版）----
+print_proxy_snippet_https() {
+    local backend_target="127.0.0.1:$WEB_PORT"
+    echo -e "${YELLOW}—————— 复制到你现有 Nginx 的 conf.d/（整段 server）——————${NC}"
+    cat <<EOF
+# 漫创AI Web —— $DOMAIN 反代到本项目入口（监听回环 $WEB_PORT）
+server {
+    listen 80;
+    server_name $DOMAIN;
+    # 如需强制 HTTPS，取消下一行注释（并确保已配置 443）
+    # return 301 https://\$host\$request_uri;
+    location / {
+        proxy_pass http://$backend_target;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_http_version 1.1;
+        client_max_body_size 200m;
+    }
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name $DOMAIN;
+
+    # 用你现有的证书路径（你的容器里证书挂在 /etc/nginx/certs/）
+    ssl_certificate     /etc/nginx/certs/$DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/nginx/certs/$DOMAIN/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    location / {
+        proxy_pass http://$backend_target;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_http_version 1.1;
+        client_max_body_size 200m;
+    }
+}
+EOF
+    echo -e "${YELLOW}—————————————————————————————————————————————————————${NC}"
+    info "把证书路径改成你实际的文件名后，reload 你的反代即可。前端 config.js 同源，无需改动。"
 }
 
 # ================ 2. 配置域名 + HTTPS ================
@@ -303,6 +466,27 @@ do_configure_domain() {
     [[ -z "$new_domain" ]] && { warn "域名不能为空"; sleep 1; show_menu; return; }
     DOMAIN="$new_domain"
     ok "域名: $DOMAIN"
+
+    # 接入模式：HTTPS 由你现有的前置反代负责，本项目不申请证书、不动自己的 nginx。
+    # 这里只记录域名（供存储公网地址用），并打印带 HTTPS 的反代配置片段。
+    if [[ "$ACCESS_MODE" == "proxy" ]]; then
+        echo ""
+        info "当前为「接入现有反代」模式：HTTPS 由你的前置 Nginx/反代负责。"
+        info "本项目只监听回环 127.0.0.1:$WEB_PORT，无需在此申请证书。"
+        # 更新存储公网地址为 https 域名
+        configure_env_domain
+        restart_backend
+        save_state
+        echo ""
+        info "在你现有反代里为 ${CYAN}$DOMAIN${NC} 配置 HTTPS（证书自理），并加入以下转发："
+        echo ""
+        print_proxy_snippet
+        echo ""
+        ok "域名已记录，存储公网地址已更新为 https://$DOMAIN"
+        read -p "按回车返回主菜单..." </dev/tty
+        show_menu
+        return
+    fi
 
     # 证书：检测已有 / 申请 / 手动
     echo ""
@@ -427,7 +611,11 @@ do_change_port() {
     save_state
     get_server_ip
     ok "端口已改为 $WEB_PORT"
-    echo -e "  访问地址: ${GREEN}http://$SERVER_IP:$WEB_PORT${NC}"
+    if [[ "$ACCESS_MODE" == "proxy" ]]; then
+        warn "接入模式：端口变了，记得更新你现有反代里的 proxy_pass 目标为 127.0.0.1:$WEB_PORT 并 reload。"
+    else
+        echo -e "  访问地址: ${GREEN}http://$SERVER_IP:$WEB_PORT${NC}"
+    fi
     read -p "按回车返回主菜单..." </dev/tty
     show_menu
 }
@@ -493,9 +681,18 @@ do_status() {
     fi
 
     echo ""
-    echo -e "  对外端口: ${CYAN}$WEB_PORT${NC}"
-    echo -e "  访问地址: ${GREEN}http://$SERVER_IP:$WEB_PORT${NC}"
-    [[ -n "$DOMAIN" ]] && echo -e "  域名访问: ${GREEN}https://$DOMAIN${NC}"
+    if [[ "$ACCESS_MODE" == "proxy" ]]; then
+        echo -e "  访问模式: ${CYAN}接入现有反代${NC}（本项目监听回环 127.0.0.1:$WEB_PORT）"
+        if [[ -n "$DOMAIN" ]]; then
+            echo -e "  域名访问: ${GREEN}https://$DOMAIN${NC}（经你的前置反代）"
+        else
+            warn "  尚未配置域名，请在你的反代里把域名转发到 127.0.0.1:$WEB_PORT"
+        fi
+    else
+        echo -e "  对外端口: ${CYAN}$WEB_PORT${NC}"
+        echo -e "  访问地址: ${GREEN}http://$SERVER_IP:$WEB_PORT${NC}"
+        [[ -n "$DOMAIN" ]] && echo -e "  域名访问: ${GREEN}https://$DOMAIN${NC}"
+    fi
     echo ""
     info "后端健康检查："
     curl -s --max-time 5 "http://127.0.0.1:$BACKEND_PORT/health" && echo "" || warn "后端无响应"
@@ -577,6 +774,12 @@ do_uninstall() {
 
     # 清理 hb 快捷命令
     rm -f /usr/local/bin/hb 2>/dev/null || true
+
+    if [[ "$ACCESS_MODE" == "proxy" ]]; then
+        echo ""
+        warn "你之前用的是「接入现有反代」模式：本项目没有改过你的反代配置，"
+        warn "请记得手动删除你现有 Nginx 里指向 127.0.0.1:$WEB_PORT 的那段 server/location，再 reload。"
+    fi
 
     rm -rf "$INSTALL_DIR"
     ok "卸载完成"
@@ -741,8 +944,11 @@ regen_compose() {
     cd "$INSTALL_DIR"
     # 渲染到项目根目录：compose 内的相对路径（.env.deploy、./web、./data、
     # ./deploy/nginx/runtime）都以 compose 文件所在目录为基准，必须放根目录。
+    # __PUBLISH__：端口发布串。standalone=$WEB_PORT:80（外网可达）；
+    # proxy=127.0.0.1:$WEB_PORT:80（仅本机反代可达，外网碰不到）。
     sed -e "s|__WEB_PORT__|$WEB_PORT|g" \
         -e "s|__BACKEND_PORT__|$BACKEND_PORT|g" \
+        -e "s|__PUBLISH__|$(compose_publish)|g" \
         deploy/docker-compose.libai.yml.tpl > docker-compose.libai.yml
 }
 
@@ -825,7 +1031,8 @@ start_systemd() {
 regen_nginx_http_systemd() {
     cd "$INSTALL_DIR"
     cp deploy/nginx/_libai_proxy.host.inc /etc/nginx/snippets/_libai_proxy.inc
-    sed -e "s|__LISTEN__|$WEB_PORT|g" \
+    # proxy 模式只监听回环（127.0.0.1:端口），standalone 监听所有网卡（端口）
+    sed -e "s|__LISTEN__|$(web_listen_addr)|g" \
         -e "s|__SERVER_NAME__|_|g" \
         -e "s|__ROOT__|$INSTALL_DIR/web|g" \
         -e "s|__BACKEND__|127.0.0.1:$BACKEND_PORT|g" \

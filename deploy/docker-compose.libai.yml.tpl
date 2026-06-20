@@ -35,8 +35,8 @@ services:
     depends_on:
       - backend
     ports:
-      # 自定义对外端口 → 容器内 80
-      - "__WEB_PORT__:80"
+      # 对外发布串（standalone: 端口:80；proxy: 127.0.0.1:端口:80，仅本机反代可达）
+      - "__PUBLISH__"
     volumes:
       # 运行时渲染好的 nginx 配置（前端静态 + 后端 API 反代）
       - ./deploy/nginx/runtime/libai.conf:/etc/nginx/conf.d/default.conf:ro
