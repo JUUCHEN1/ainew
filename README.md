@@ -136,25 +136,33 @@ set LIBAI_FFPROBE_PATH=C:\path\to\ffprobe.exe
 
 ## 部署到服务器（生产）
 
-推荐前后端同域名 + 反向代理（Nginx），避免跨域且更安全：
+提供两套开箱即用的部署方案，完整步骤见 **[deploy/README.md](deploy/README.md)**：
 
-1. **后端**：用进程守护跑 `python server/run.py`（或直接
-   `uvicorn backend.app:app --host 127.0.0.1 --port 8765`，注意 `app_dir=server`）。
-2. **前端**：把 `web/` 作为静态资源由 Nginx 托管。
-3. **Nginx**：前端走 `/`，后端走 `/api/`（或独立子域名）。
-   若前后端**同源**，把 `web/config.js` 改成：
+- **Docker + Compose**（推荐）：`docker compose up -d --build` 一条命令起，
+  自带后端镜像、Nginx 反代、`data/` 持久化。
+- **systemd + Nginx**：不装 Docker，资源最省，宿主机直接跑。
+
+两种方式都用 Nginx 同域反代（前端走 `/`，后端固定 API 前缀反代到 `:8765`，
+已处理前端打包产物与后端 `/assets` 接口的路径冲突），并统一 HTTPS 入口。
+
+部署前必改 3 处（详见 deploy/README）：
+
+1. `web/config.js` 改为同源：
    ```js
-   window.__LIBAI_BACKEND_BASE_URL__ = window.location.origin;  // 同源部署
+   window.__LIBAI_BACKEND_BASE_URL__ = window.location.origin;
    ```
-   并在 Nginx 把 API 路径反代到后端。
-4. 同源部署时务必为后端补 `LIBAI_CORS_ORIGINS=你的域名`（即使同源也建议显式配置）。
+2. CORS：环境变量 `LIBAI_CORS_ORIGINS=你的域名`（跨域/独立子域必填）。
+3. 参考图存储（图生视频等需要公网可访问的图片 URL），三选一：
+   本机自托管 `LIBAI_PUBLIC_BASE_URL` / S3·腾讯云 COS / 自定义图床。
+   配置项见 `.env.deploy.example`。
 
-> WebSocket：任务进度走 `/jobs/events`（WS）。反向代理需开启 WebSocket 透传
-> （Nginx 的 `proxy_set_header Upgrade/Connection`）。
+> WebSocket：任务进度走 `/jobs/events`（WS）。上述 Nginx 配置已开启长连接透传。
 
 ### 安全提醒
-- 后端默认 `0.0.0.0` 监听，**公网暴露前**请放在反代之后，并限制来源；
-  当前后端**没有内置鉴权**（原本依赖 Electron 本地环境），公网部署需自行在反代层加访问控制。
+- 后端默认 `0.0.0.0` 监听，**公网暴露前**请放在反代之后并限制来源。
+  Docker 方案已把后端绑定 `127.0.0.1`，仅 Nginx 可访问。
+- 当前后端**没有内置鉴权**（原本依赖 Electron 本地环境），公网部署需自行在反代层
+  加访问控制（IP 白名单 / basic auth），否则陌生人可调用接口消耗你的额度。
 - 不要把 `data/` 目录暴露给静态服务。
 
 ---
